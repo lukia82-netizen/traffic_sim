@@ -88,12 +88,17 @@ async function main() {
       .stroke({ width: 2, color: COLOR.cross });
   }
 
-  // 5. Dynamic vehicle layer
+  // 5. Debug layer (laser lines — rendered below vehicles)
+  const debugLayer = new PIXI.Graphics();
+  app.stage.addChild(debugLayer);
+
+  // 6. Dynamic vehicle layer
   const dynamicLayer = new PIXI.Container();
   app.stage.addChild(dynamicLayer);
 
   const vehicleGraphics = new Map();
   const vehicleLabels   = new Map();
+  const leaderMarkers   = new Map(); // "L" text above leaders
 
   function getOrCreateVehicle(id) {
     if (!vehicleGraphics.has(id)) {
@@ -134,7 +139,21 @@ async function main() {
     label.y = sy - VEHICLE_RADIUS - 4;
   }
 
-  // 6. FPS counter
+  function getOrCreateLeaderMarker(id) {
+    if (!leaderMarkers.has(id)) {
+      const m = new PIXI.Text({
+        text: "L",
+        style: { fontSize: 11, fill: 0xffffff, fontFamily: "monospace", fontWeight: "bold" },
+      });
+      m.anchor.set(0.5, 0.5);
+      m.alpha = 0.75;
+      dynamicLayer.addChild(m);
+      leaderMarkers.set(id, m);
+    }
+    return leaderMarkers.get(id);
+  }
+
+  // 7. FPS counter
   let frameCount = 0;
   let lastFpsTime = performance.now();
 
@@ -153,7 +172,7 @@ async function main() {
     }
   }
 
-  // 7. Subscribe to Tauri events
+  // 8. Subscribe to Tauri events
   statsEl.textContent = "Connecting to simulation...";
 
   let staticSceneDrawn = false;
@@ -169,14 +188,49 @@ async function main() {
         staticSceneDrawn = true;
       }
 
-      // Collect ids present this frame to remove departed vehicles.
+      // Build a quick id→vehicle lookup for the debug pass.
+      const byId = new Map(frame.vehicles.map((v) => [v.id, v]));
+
+      // ── Debug: laser lines between followers and their leaders ────────────
+      debugLayer.clear();
+      // Collect which vehicles ARE leaders so we can draw the 'L' badge.
+      const leaderIds = new Set();
+      for (const v of frame.vehicles) {
+        if (v.leader_id == null) continue;
+        const leader = byId.get(v.leader_id);
+        if (!leader) continue;
+        leaderIds.add(v.leader_id);
+        const { sx: fx, sy: fy } = toScreen(v.x, v.y);
+        const { sx: lx, sy: ly } = toScreen(leader.x, leader.y);
+        debugLayer
+          .moveTo(fx, fy)
+          .lineTo(lx, ly)
+          .stroke({ width: 1, color: 0xffffff, alpha: 0.3 });
+      }
+
+      // Show / hide 'L' markers.
       const activeIds = new Set(frame.vehicles.map((v) => v.id));
+      for (const v of frame.vehicles) {
+        if (leaderIds.has(v.id)) {
+          const m = getOrCreateLeaderMarker(v.id);
+          const { sx, sy } = toScreen(v.x, v.y);
+          m.x = sx + VEHICLE_RADIUS + 6;
+          m.y = sy - VEHICLE_RADIUS - 2;
+          m.visible = true;
+        } else if (leaderMarkers.has(v.id)) {
+          leaderMarkers.get(v.id).visible = false;
+        }
+      }
+
+      // Remove graphics for vehicles that have left the scene.
       for (const [id, g] of vehicleGraphics) {
         if (!activeIds.has(id)) {
           dynamicLayer.removeChild(g);
           vehicleGraphics.delete(id);
           const label = vehicleLabels.get(id);
           if (label) { dynamicLayer.removeChild(label); vehicleLabels.delete(id); }
+          const marker = leaderMarkers.get(id);
+          if (marker) { dynamicLayer.removeChild(marker); leaderMarkers.delete(id); }
         }
       }
 
@@ -188,14 +242,16 @@ async function main() {
     });
 
     await listen("sim-done", () => {
-      // Clear all remaining vehicle graphics.
+      debugLayer.clear();
       for (const g of vehicleGraphics.values()) dynamicLayer.removeChild(g);
       for (const l of vehicleLabels.values()) dynamicLayer.removeChild(l);
+      for (const m of leaderMarkers.values()) dynamicLayer.removeChild(m);
       vehicleGraphics.clear();
       vehicleLabels.clear();
+      leaderMarkers.clear();
 
       statsEl.style.color = "#44ff88";
-      statsEl.textContent = "Simulation complete — all 4 vehicles crossed.";
+      statsEl.textContent = "Simulation complete — all vehicles crossed.";
     });
 
     console.log("Listening for sim-frame / sim-done events...");

@@ -37,6 +37,7 @@ struct Vehicle {
     current_speed: f32,
     acceleration: f32,
     status: VehicleStatus,
+    leader_id: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +240,7 @@ impl SimulationState {
                     current_speed: 0.0,
                     acceleration: 0.0,
                     status: VehicleStatus::Cruising,
+                    leader_id: None,
                 }
             })
             .collect();
@@ -321,8 +323,7 @@ impl SimulationState {
     fn idm_step(&mut self) {
         let idm = self.cfg.idm.clone();
 
-        // Snapshot: (id, position, approach_dir, current_speed) — needed to
-        // find leaders without a double-borrow of self.vehicles.
+        // Snapshot: (id, position, approach_dir, current_speed).
         let snapshot: Vec<(usize, Vec2, Vec2, f32)> = self
             .vehicles
             .iter()
@@ -337,30 +338,29 @@ impl SimulationState {
             let free_road = 1.0 - (speed / v0).powf(idm.delta);
 
             // ── Leader search: same lane, closest vehicle ahead ───────────────
-            // "Same lane" = approach directions are parallel (dot > 0.99).
-            // "Ahead"     = vector from follower to candidate projected onto
-            //               approach_dir is positive.
             let leader = snapshot
                 .iter()
                 .filter(|(id, _, dir, _)| {
                     *id != v.id && dir.dot(v.approach_dir) > 0.99
                 })
-                .filter_map(|(_, pos, _, leader_speed)| {
+                .filter_map(|(lid, pos, _, leader_speed)| {
                     let to_leader = *pos - v.position;
-                    let proj = to_leader.dot(v.approach_dir); // positive = ahead
+                    let proj = to_leader.dot(v.approach_dir);
                     if proj > 0.0 {
-                        Some((proj, *leader_speed))
+                        Some((*lid, proj, *leader_speed))
                     } else {
                         None
                     }
                 })
-                .min_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap());
+                .min_by(|(_, a, _), (_, b, _)| a.partial_cmp(b).unwrap());
+
+            // Store the leader id for debug rendering.
+            v.leader_id = leader.map(|(lid, _, _)| lid);
 
             // ── Car-following interaction term ────────────────────────────────
-            // Full IDM s* with relative-speed term (Treiber 2000).
-            let car_following = if let Some((center_gap, leader_speed)) = leader {
+            let car_following = if let Some((_, center_gap, leader_speed)) = leader {
                 let s = (center_gap - idm.vehicle_length).max(f32::EPSILON);
-                let delta_v = speed - leader_speed; // positive = closing
+                let delta_v = speed - leader_speed;
                 let s_star = idm.s0
                     + (speed * idm.t_headway
                         + speed * delta_v / (2.0 * (idm.a_max * idm.b_comf).sqrt()))
@@ -430,6 +430,7 @@ impl SimulationState {
                     status: v.status.clone(),
                     speed: v.current_speed,
                     accel: v.acceleration,
+                    leader_id: v.leader_id,
                 })
                 .collect(),
             approach_radius: self.cfg.intersection.approach_radius,
@@ -450,6 +451,7 @@ struct VehicleFrame {
     status: VehicleStatus,
     speed: f32,
     accel: f32,
+    leader_id: Option<usize>,
 }
 
 #[derive(Serialize, Clone)]
