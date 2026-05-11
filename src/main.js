@@ -160,18 +160,45 @@ async function main() {
 
   try {
     const { listen } = window.__TAURI__.event;
+
     await listen("sim-frame", (event) => {
       const frame = event.payload;
+
       if (!staticSceneDrawn) {
         drawStaticScene(frame.approach_radius, frame.clear_radius);
         staticSceneDrawn = true;
       }
+
+      // Collect ids present this frame to remove departed vehicles.
+      const activeIds = new Set(frame.vehicles.map((v) => v.id));
+      for (const [id, g] of vehicleGraphics) {
+        if (!activeIds.has(id)) {
+          dynamicLayer.removeChild(g);
+          vehicleGraphics.delete(id);
+          const label = vehicleLabels.get(id);
+          if (label) { dynamicLayer.removeChild(label); vehicleLabels.delete(id); }
+        }
+      }
+
       for (const vehicle of frame.vehicles) {
         updateVehicle(vehicle);
       }
+
       updateStats(frame);
     });
-    console.log("Listening for sim-frame events...");
+
+    await listen("sim-done", () => {
+      // Clear all remaining vehicle graphics.
+      for (const g of vehicleGraphics.values()) dynamicLayer.removeChild(g);
+      for (const l of vehicleLabels.values()) dynamicLayer.removeChild(l);
+      vehicleGraphics.clear();
+      vehicleLabels.clear();
+
+      statsEl.style.color = "#44ff88";
+      statsEl.textContent = "Simulation complete — all 4 vehicles crossed.";
+    });
+
+    console.log("Listening for sim-frame / sim-done events...");
   } catch (err) {
     showError("listen() failed: " + err);
   }

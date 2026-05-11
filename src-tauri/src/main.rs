@@ -66,13 +66,25 @@ struct IdmSection {
     s0: f32,
     t_headway: f32,
     stop_line_offset: f32,
+    /// Bumper-to-bumper correction: subtracted from center-to-center distance.
+    #[serde(default = "default_vehicle_length")]
+    vehicle_length: f32,
 }
+
+fn default_vehicle_length() -> f32 { 0.2 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SpawnSection {
-    north_spawn_y: f32,
-    east_spawn_x: f32,
+    /// Distance from the conflict point where each vehicle is placed at start.
+    #[serde(default = "default_spawn_distance")]
+    spawn_distance: f32,
+    /// How far past the conflict point before a vehicle is removed.
+    #[serde(default = "default_offmap_distance")]
+    offmap_distance: f32,
 }
+
+fn default_spawn_distance() -> f32 { 4.0 }
+fn default_offmap_distance() -> f32 { 4.5 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VehicleSection {
@@ -89,14 +101,16 @@ struct SimulationConfig {
 }
 
 impl Default for SimulationConfig {
+    /// Fallback used ONLY when sim_config.toml is missing or unparseable.
+    /// Values here must stay in sync with sim_config.toml.
     fn default() -> Self {
         Self {
             simulation: SimulationSection {
                 fixed_dt: 0.016,
-                max_frames: 0, // 0 = run indefinitely
+                max_frames: 0,
             },
             intersection: IntersectionSection {
-                approach_radius: 4.0,
+                approach_radius: 0.5,
                 clear_radius: 0.2,
             },
             idm: IdmSection {
@@ -105,11 +119,12 @@ impl Default for SimulationConfig {
                 delta: 4.0,
                 s0: 0.3,
                 t_headway: 0.8,
-                stop_line_offset: 0.8,
+                stop_line_offset: 0.2,
+                vehicle_length: 0.2,
             },
             spawn: SpawnSection {
-                north_spawn_y: 4.0,
-                east_spawn_x: 4.0,
+                spawn_distance: 4.0,
+                offmap_distance: 4.5,
             },
             vehicle: VehicleSection { max_speed: 1.0 },
         }
@@ -152,10 +167,11 @@ impl SimulationConfig {
              delta            = {}   # acceleration exponent\n\
              s0               = {}   # minimum jam gap at standstill [units]\n\
              t_headway        = {}   # safe time headway [s]\n\
-             stop_line_offset = {}   # distance before conflict point where Waiting vehicle targets to stop\n\n\
+             stop_line_offset = {}   # distance before conflict point where Waiting vehicle targets to stop\n\
+             vehicle_length   = {}   # bumper-to-bumper correction subtracted from center-to-center gap [units]\n\n\
              [spawn]\n\
-             north_spawn_y = {}   # initial Y for north vehicle\n\
-             east_spawn_x  = {}   # initial X for east vehicle\n\n\
+             spawn_distance  = {}   # distance from conflict point where each vehicle spawns [units]\n\
+             offmap_distance = {}   # distance past conflict point before vehicle is removed [units]\n\n\
              [vehicle]\n\
              max_speed = {}   # max vehicle speed [units/s]\n",
             self.simulation.fixed_dt,
@@ -168,8 +184,9 @@ impl SimulationConfig {
             self.idm.s0,
             self.idm.t_headway,
             self.idm.stop_line_offset,
-            self.spawn.north_spawn_y,
-            self.spawn.east_spawn_x,
+            self.idm.vehicle_length,
+            self.spawn.spawn_distance,
+            self.spawn.offmap_distance,
             self.vehicle.max_speed,
         )
     }
@@ -186,54 +203,30 @@ struct SimulationState {
 impl SimulationState {
     fn new(cfg: SimulationConfig) -> Self {
         let ms = cfg.vehicle.max_speed;
-        let sy = cfg.spawn.north_spawn_y;
-        let sx = cfg.spawn.east_spawn_x;
-        let vehicles = vec![
-            // North → moves south
-            Vehicle {
-                id: 0,
-                position: Vec2::new(0.0, sy),
-                approach_dir: Vec2::new(0.0, -1.0),
-                conflict_point: Vec2::ZERO,
-                max_speed: ms,
-                current_speed: 0.0,
-                acceleration: 0.0,
-                status: VehicleStatus::Cruising,
-            },
-            // East → moves west
-            Vehicle {
-                id: 1,
-                position: Vec2::new(sx, 0.0),
-                approach_dir: Vec2::new(-1.0, 0.0),
-                conflict_point: Vec2::ZERO,
-                max_speed: ms,
-                current_speed: 0.0,
-                acceleration: 0.0,
-                status: VehicleStatus::Cruising,
-            },
-            // South → moves north
-            Vehicle {
-                id: 2,
-                position: Vec2::new(0.0, -sy),
-                approach_dir: Vec2::new(0.0, 1.0),
-                conflict_point: Vec2::ZERO,
-                max_speed: ms,
-                current_speed: 0.0,
-                acceleration: 0.0,
-                status: VehicleStatus::Cruising,
-            },
-            // West → moves east
-            Vehicle {
-                id: 3,
-                position: Vec2::new(-sx, 0.0),
-                approach_dir: Vec2::new(1.0, 0.0),
-                conflict_point: Vec2::ZERO,
-                max_speed: ms,
-                current_speed: 0.0,
-                acceleration: 0.0,
-                status: VehicleStatus::Cruising,
-            },
+        let d = cfg.spawn.spawn_distance;
+
+        // Each entry: (id, spawn_pos, approach_dir).
+        // All distances come from cfg — nothing hardcoded here.
+        let lane_defs: [(usize, Vec2, Vec2); 4] = [
+            (0, Vec2::new(0.0,  d), Vec2::new( 0.0, -1.0)), // North → south
+            (1, Vec2::new( d, 0.0), Vec2::new(-1.0,  0.0)), // East  → west
+            (2, Vec2::new(0.0, -d), Vec2::new( 0.0,  1.0)), // South → north
+            (3, Vec2::new(-d, 0.0), Vec2::new( 1.0,  0.0)), // West  → east
         ];
+
+        let vehicles = lane_defs
+            .iter()
+            .map(|&(id, pos, dir)| Vehicle {
+                id,
+                position: pos,
+                approach_dir: dir,
+                conflict_point: Vec2::ZERO,
+                max_speed: ms,
+                current_speed: 0.0,
+                acceleration: 0.0,
+                status: VehicleStatus::Cruising,
+            })
+            .collect();
         Self {
             vehicles,
             manager: ConflictManager { granted: None },
@@ -245,7 +238,12 @@ impl SimulationState {
         self.intersection_step();
         self.idm_step();
         self.movement_step(dt);
-        self.respawn_step();
+        self.remove_finished();
+    }
+
+    /// Returns true when all vehicles have left the map.
+    fn is_finished(&self) -> bool {
+        self.vehicles.is_empty()
     }
 
     // ── Conflict arbiter ──────────────────────────────────────────────────────
@@ -306,18 +304,64 @@ impl SimulationState {
     // ── IDM acceleration ──────────────────────────────────────────────────────
 
     fn idm_step(&mut self) {
-        let idm = &self.cfg.idm;
+        let idm = self.cfg.idm.clone();
+
+        // Snapshot: (id, position, approach_dir, current_speed) — needed to
+        // find leaders without a double-borrow of self.vehicles.
+        let snapshot: Vec<(usize, Vec2, Vec2, f32)> = self
+            .vehicles
+            .iter()
+            .map(|v| (v.id, v.position, v.approach_dir, v.current_speed))
+            .collect();
+
         for v in &mut self.vehicles {
             let speed = v.current_speed;
             let v0 = v.max_speed;
+
+            // ── Free-road term ────────────────────────────────────────────────
+            let free_road = 1.0 - (speed / v0).powf(idm.delta);
+
+            // ── Leader search: same lane, closest vehicle ahead ───────────────
+            // "Same lane" = approach directions are parallel (dot > 0.99).
+            // "Ahead"     = vector from follower to candidate projected onto
+            //               approach_dir is positive.
+            let leader = snapshot
+                .iter()
+                .filter(|(id, _, dir, _)| {
+                    *id != v.id && dir.dot(v.approach_dir) > 0.99
+                })
+                .filter_map(|(_, pos, _, leader_speed)| {
+                    let to_leader = *pos - v.position;
+                    let proj = to_leader.dot(v.approach_dir); // positive = ahead
+                    if proj > 0.0 {
+                        Some((proj, *leader_speed))
+                    } else {
+                        None
+                    }
+                })
+                .min_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap());
+
+            // ── Car-following interaction term ────────────────────────────────
+            // Full IDM s* with relative-speed term (Treiber 2000).
+            let car_following = if let Some((center_gap, leader_speed)) = leader {
+                let s = (center_gap - idm.vehicle_length).max(f32::EPSILON);
+                let delta_v = speed - leader_speed; // positive = closing
+                let s_star = idm.s0
+                    + (speed * idm.t_headway
+                        + speed * delta_v / (2.0 * (idm.a_max * idm.b_comf).sqrt()))
+                    .max(0.0);
+                (s_star / s).powi(2)
+            } else {
+                0.0
+            };
+
+            // ── Intersection interaction term ─────────────────────────────────
+            // Treat the stop line as a virtual stationary leader for Waiting
+            // vehicles that have not yet crossed the conflict point.
             let to_conflict = v.position - v.conflict_point;
             let past_point = to_conflict.dot(v.approach_dir) > 0.0;
 
-            // Free-road term: accelerate toward v0.
-            let free_road = 1.0 - (speed / v0).powf(idm.delta);
-
-            // Interaction term: only for Waiting vehicles still approaching.
-            let interaction = if v.status == VehicleStatus::Waiting && !past_point {
+            let intersection = if v.status == VehicleStatus::Waiting && !past_point {
                 let s = (to_conflict.length() - idm.stop_line_offset).max(f32::EPSILON);
                 let s_star = idm.s0 + speed * idm.t_headway;
                 (s_star / s).powi(2)
@@ -325,6 +369,8 @@ impl SimulationState {
                 0.0
             };
 
+            // Worst-case (most braking) wins.
+            let interaction = car_following.max(intersection);
             v.acceleration = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
         }
     }
@@ -338,32 +384,19 @@ impl SimulationState {
         }
     }
 
-    // ── Respawn vehicles that have driven off-screen ──────────────────────────
+    // ── Remove vehicles that have driven off the map ──────────────────────────
 
-    fn respawn_step(&mut self) {
-        let sy = self.cfg.spawn.north_spawn_y;
-        let sx = self.cfg.spawn.east_spawn_x;
-        // Respawn positions and directions indexed by vehicle id.
-        let spawns: [(Vec2, Vec2); 4] = [
-            (Vec2::new(0.0, sy),   Vec2::new(0.0, -1.0)),
-            (Vec2::new(sx, 0.0),   Vec2::new(-1.0, 0.0)),
-            (Vec2::new(0.0, -sy),  Vec2::new(0.0,  1.0)),
-            (Vec2::new(-sx, 0.0),  Vec2::new(1.0,  0.0)),
-        ];
-
-        for v in &mut self.vehicles {
+    fn remove_finished(&mut self) {
+        let offmap = self.cfg.spawn.offmap_distance;
+        self.vehicles.retain(|v| {
             let to_conflict = v.position - v.conflict_point;
             let past_point = to_conflict.dot(v.approach_dir) > 0.0;
-            // Once clearly past, and far enough, loop back to spawn.
-            if past_point && to_conflict.length() > sy * 0.9 {
-                let (pos, dir) = spawns[v.id];
-                v.position = pos;
-                v.approach_dir = dir;
-                v.current_speed = 0.0;
-                v.acceleration = 0.0;
-                v.status = VehicleStatus::Cruising;
-                // Release grant if this vehicle held it.
-                // (intersection_step handles this, but reset here for safety.)
+            !(past_point && to_conflict.length() > offmap)
+        });
+        // If the removed vehicle held the grant, clear it.
+        if let Some(id) = self.manager.granted {
+            if !self.vehicles.iter().any(|v| v.id == id) {
+                self.manager.granted = None;
             }
         }
     }
@@ -431,14 +464,20 @@ fn start_simulation_loop(app_handle: AppHandle, state: SharedState) {
             let dt = now.duration_since(last).as_secs_f32();
             last = now;
 
-            let frame = {
+            let (frame, finished) = {
                 let mut sim = state.lock().unwrap();
                 sim.tick(dt);
-                sim.to_frame()
+                let finished = sim.is_finished();
+                (sim.to_frame(), finished)
             };
 
             if let Err(e) = app_handle.emit("sim-frame", &frame) {
                 eprintln!("emit error: {e}");
+            }
+
+            if finished {
+                let _ = app_handle.emit("sim-done", ());
+                break;
             }
 
             // Sleep for the remainder of the frame budget.
