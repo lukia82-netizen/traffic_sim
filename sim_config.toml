@@ -6,7 +6,7 @@ fixed_dt   = 0.016    # Krok symulacji w sekundach
 max_frames = 20000    # Liczba klatek po której aplikacja się zamknie
 
 [intersection]
-approach_radius = 3.0   # Odległość od punktu kolizji, od której pojazd zgłasza chęć wjazdu
+approach_radius = 1.5   # Odległość od punktu kolizji, od której pojazd zgłasza chęć wjazdu
 clear_radius    = 0.2   # Odległość za punktem kolizji potrzebna do zwolnienia przejazdu
 
 [spawn]

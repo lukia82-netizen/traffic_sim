@@ -47,6 +47,12 @@ struct Intersection {
     conflict_point: Vec2,
 }
 
+/// Ties a debug-label entity back to the vehicle entity it describes.
+#[derive(Component)]
+struct VehicleLabel {
+    vehicle_entity: Entity,
+}
+
 // ─── Resources ────────────────────────────────────────────────────────────────
 
 /// The central arbiter: at most one entity may occupy the conflict point at a time.
@@ -256,34 +262,52 @@ fn startup(mut commands: Commands, cfg: Res<SimulationConfig>) {
     });
 
     // North vehicle: travelling south along the Y axis.
-    commands.spawn((
-        Position(Vec2::new(0.0, cfg.spawn.north_spawn_y)),
-        Vehicle {
-            max_speed: cfg.vehicle.max_speed,
-            status: VehicleStatus::Cruising,
-            current_speed: 0.0,
-            acceleration: 0.0,
-        },
-        Path {
-            conflict_point: Vec2::ZERO,
-            approach_dir: Vec2::new(0.0, -1.0),
-        },
-    ));
+    let north = commands
+        .spawn((
+            Position(Vec2::new(0.0, cfg.spawn.north_spawn_y)),
+            Vehicle {
+                max_speed: cfg.vehicle.max_speed,
+                status: VehicleStatus::Cruising,
+                current_speed: 0.0,
+                acceleration: 0.0,
+            },
+            Path {
+                conflict_point: Vec2::ZERO,
+                approach_dir: Vec2::new(0.0, -1.0),
+            },
+        ))
+        .id();
 
     // East vehicle: travelling west along the X axis.
-    commands.spawn((
-        Position(Vec2::new(cfg.spawn.east_spawn_x, 0.0)),
-        Vehicle {
-            max_speed: cfg.vehicle.max_speed,
-            status: VehicleStatus::Cruising,
-            current_speed: 0.0,
-            acceleration: 0.0,
-        },
-        Path {
-            conflict_point: Vec2::ZERO,
-            approach_dir: Vec2::new(-1.0, 0.0),
-        },
-    ));
+    let east = commands
+        .spawn((
+            Position(Vec2::new(cfg.spawn.east_spawn_x, 0.0)),
+            Vehicle {
+                max_speed: cfg.vehicle.max_speed,
+                status: VehicleStatus::Cruising,
+                current_speed: 0.0,
+                acceleration: 0.0,
+            },
+            Path {
+                conflict_point: Vec2::ZERO,
+                approach_dir: Vec2::new(-1.0, 0.0),
+            },
+        ))
+        .id();
+
+    // Debug labels — one per vehicle, positioned above each circle.
+    for vehicle_entity in [north, east] {
+        commands.spawn((
+            Text2d::new(""),
+            TextFont {
+                font_size: 18.0,
+                ..default()
+            },
+            TextColor(css::YELLOW.into()),
+            Transform::from_xyz(0.0, 0.0, 1.0),
+            VehicleLabel { vehicle_entity },
+        ));
+    }
 }
 
 // ─── Camera Setup ─────────────────────────────────────────────────────────────
@@ -406,6 +430,30 @@ fn termination_system(
     }
 }
 
+// ─── Vehicle Label System ─────────────────────────────────────────────────────
+
+fn update_vehicle_labels_system(
+    mut labels: Query<(&VehicleLabel, &mut Transform, &mut Text2d)>,
+    vehicles: Query<(&Position, &Vehicle)>,
+) {
+    for (label, mut transform, mut text) in &mut labels {
+        if let Ok((pos, vehicle)) = vehicles.get(label.vehicle_entity) {
+            let screen = pos.0 * VISUAL_SCALE;
+            transform.translation = Vec3::new(screen.x, screen.y + VEHICLE_RADIUS_PX + 50.0, 1.0);
+
+            let status = match vehicle.status {
+                VehicleStatus::Cruising => "Cruising",
+                VehicleStatus::Waiting => "Waiting",
+                VehicleStatus::Crossing => "Crossing",
+            };
+            text.0 = format!(
+                "V: {:.2} | A: {:.2} | {}",
+                vehicle.current_speed, vehicle.acceleration, status
+            );
+        }
+    }
+}
+
 // ─── Gizmo Draw System ────────────────────────────────────────────────────────
 
 fn draw_gizmos_system(
@@ -465,6 +513,7 @@ fn main() {
                 intersection_system,
                 idm_system,
                 movement_system,
+                update_vehicle_labels_system,
                 draw_gizmos_system,
                 termination_system,
             )
