@@ -13,7 +13,7 @@ approach_radius = 1.0
 # Distance after crossing required to release intersection grant.
 clear_radius = 0.2
 # Waiting vehicles coast forward until this distance from the conflict point.
-stop_distance = 0.15
+stop_distance = 0.21
 
 [spawn]
 # Initial Y for north vehicle (moves toward negative Y).

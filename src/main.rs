@@ -260,8 +260,10 @@ fn intersection_system(
     let mut approaching: Vec<(Entity, u32)> = q
         .iter()
         .filter_map(|(entity, pos, _, path)| {
-            let dist = pos.0.distance(path.conflict_point);
-            if dist < cfg.intersection.approach_radius {
+            let to_conflict = pos.0 - path.conflict_point;
+            let past_point = to_conflict.dot(path.approach_dir) > 0.0;
+            let dist = to_conflict.length();
+            if dist < cfg.intersection.approach_radius && !past_point {
                 Some((entity, entity.index_u32()))
             } else {
                 None
