@@ -88,6 +88,8 @@ struct IdmSection {
     s0: f32,
     /// Safe time headway (s).
     t_headway: f32,
+    /// Distance before the conflict point where a Waiting vehicle targets to stop.
+    stop_line_offset: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,11 +120,12 @@ impl Default for SimulationConfig {
             },
             vehicle: VehicleSection { max_speed: 1.0 },
             idm: IdmSection {
-                a_max: 1.5,
-                b_comf: 2.0,
+                a_max: 1.0,
+                b_comf: 1.5,
                 delta: 4.0,
-                s0: 1.0,
-                t_headway: 1.5,
+                s0: 0.3,
+                t_headway: 0.8,
+                stop_line_offset: 0.8,
             },
         }
     }
@@ -198,6 +201,9 @@ impl SimulationConfig {
         if cfg.idm.t_headway <= 0.0 {
             return Err("idm.t_headway must be > 0".to_string());
         }
+        if cfg.idm.stop_line_offset < 0.0 {
+            return Err("idm.stop_line_offset must be >= 0".to_string());
+        }
 
         Ok(cfg)
     }
@@ -218,11 +224,12 @@ east_spawn_x  = {}   # initial X for east vehicle (moves toward negative X)\n\n\
 [vehicle]\n\
 max_speed = {}   # max vehicle speed [units/s]\n\n\
 [idm]\n\
-a_max     = {}   # max acceleration [m/s²]\n\
-b_comf    = {}   # comfortable braking — clamps minimum deceleration [m/s²]\n\
-delta     = {}   # acceleration exponent (IDM curve shape)\n\
-s0        = {}   # minimum jam gap at standstill [units]\n\
-t_headway = {}   # safe time headway [s]\n",
+a_max             = {}   # max acceleration [m/s²]\n\
+b_comf            = {}   # comfortable braking — clamps minimum deceleration [m/s²]\n\
+delta             = {}   # acceleration exponent (IDM curve shape)\n\
+s0                = {}   # minimum jam gap at standstill [units]\n\
+t_headway         = {}   # safe time headway [s]\n\
+stop_line_offset  = {}   # distance before conflict point where Waiting vehicle targets to stop\n",
             self.simulation.fixed_dt,
             self.simulation.max_frames,
             self.intersection.approach_radius,
@@ -235,6 +242,7 @@ t_headway = {}   # safe time headway [s]\n",
             self.idm.delta,
             self.idm.s0,
             self.idm.t_headway,
+            self.idm.stop_line_offset,
         )
     }
 }
@@ -360,8 +368,10 @@ fn idm_system(cfg: Res<SimulationConfig>, mut q: Query<(&Position, &mut Vehicle,
         let free_road = 1.0 - (v / v0).powf(idm.delta);
 
         // Interaction term: only for Waiting vehicles still approaching.
+        // Gap 's' is measured to the virtual stop line, not to the conflict point centre,
+        // so the vehicle smoothly crawls up to stop_line_offset units before the junction.
         let interaction = if vehicle.status == VehicleStatus::Waiting && !past_point {
-            let s = to_conflict.length().max(f32::EPSILON);
+            let s = (to_conflict.length() - idm.stop_line_offset).max(f32::EPSILON);
             let s_star = idm.s0 + v * idm.t_headway;
             (s_star / s).powi(2)
         } else {
