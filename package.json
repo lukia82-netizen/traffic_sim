@@ -1,0 +1,13 @@
+{
+  "name": "traffic-sim",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "npx tauri dev",
+    "build": "npx tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

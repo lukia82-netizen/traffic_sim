@@ -1,5 +1,5 @@
-# Startup script for traffic_sim (Bevy 0.18.1 / GNU toolchain)
-# Adds MinGW64 dlltool to PATH, then builds and runs the simulation.
+# Startup script for traffic_sim (Tauri 2 + Pixi.js)
+# Adds MinGW64 to PATH, prints config summary, then launches the app.
 
 $mingwBin = "C:\msys64\mingw64\bin"
 if (-not ($env:PATH -split ";" | Where-Object { $_ -eq $mingwBin })) {
@@ -12,50 +12,46 @@ Push-Location $projectDir
 $configPath = Join-Path $projectDir "sim_config.toml"
 
 function Get-TomlScalar {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Text,
-        [Parameter(Mandatory = $true)]
-        [string]$Key
-    )
-
+    param([string]$Text, [string]$Key)
     foreach ($line in ($Text -split "`n")) {
-        $trimmed = $line.Trim()
-        if ($trimmed -eq "" -or $trimmed.StartsWith("#") -or $trimmed.StartsWith("[")) {
-            continue
-        }
-
-        if ($trimmed -match ("^" + [regex]::Escape($Key) + "\s*=\s*(.+)$")) {
+        $t = $line.Trim()
+        if ($t -eq "" -or $t.StartsWith("#") -or $t.StartsWith("[")) { continue }
+        if ($t -match ("^" + [regex]::Escape($Key) + "\s*=\s*([^#]+)")) {
             return $Matches[1].Trim()
         }
     }
-
-    return $null
+    return "(not found)"
 }
 
 if (Test-Path $configPath) {
-    $configText = Get-Content $configPath -Raw
-    $fixedDt = Get-TomlScalar -Text $configText -Key "fixed_dt"
-    $maxFrames = Get-TomlScalar -Text $configText -Key "max_frames"
-    $approachRadius = Get-TomlScalar -Text $configText -Key "approach_radius"
-    $clearRadius = Get-TomlScalar -Text $configText -Key "clear_radius"
-    $maxSpeed = Get-TomlScalar -Text $configText -Key "max_speed"
-
-    Write-Host "==> Key config from sim_config.toml" -ForegroundColor Yellow
-    Write-Host "    fixed_dt=$fixedDt, max_frames=$maxFrames, approach_radius=$approachRadius, clear_radius=$clearRadius, max_speed=$maxSpeed"
+    $cfg = Get-Content $configPath -Raw
+    Write-Host ""
+    Write-Host "==> sim_config.toml" -ForegroundColor Yellow
+    Write-Host ("    approach_radius=" + (Get-TomlScalar $cfg "approach_radius") +
+                "  clear_radius=" + (Get-TomlScalar $cfg "clear_radius"))
+    Write-Host ("    a_max=" + (Get-TomlScalar $cfg "a_max") +
+                "  b_comf=" + (Get-TomlScalar $cfg "b_comf") +
+                "  s0=" + (Get-TomlScalar $cfg "s0") +
+                "  t_headway=" + (Get-TomlScalar $cfg "t_headway"))
+    Write-Host ("    max_speed=" + (Get-TomlScalar $cfg "max_speed") +
+                "  stop_line_offset=" + (Get-TomlScalar $cfg "stop_line_offset"))
+    Write-Host ""
 } else {
-    Write-Host "==> sim_config.toml not found; app will create defaults on first run." -ForegroundColor Yellow
+    Write-Host "==> sim_config.toml not found - defaults will be created on first run." -ForegroundColor Yellow
 }
 
-Write-Host "==> Building traffic_sim..." -ForegroundColor Cyan
-cargo build
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Build failed." -ForegroundColor Red
-    Pop-Location
-    exit $LASTEXITCODE
+if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+    Write-Host "ERROR: npm not found. Install Node.js from https://nodejs.org" -ForegroundColor Red
+    Pop-Location; exit 1
 }
 
-Write-Host "==> Running traffic_sim..." -ForegroundColor Green
-cargo run
+if (-not (Test-Path "node_modules")) {
+    Write-Host "==> Installing npm dependencies..." -ForegroundColor Cyan
+    npm install
+    if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+}
+
+Write-Host "==> Starting Tauri dev mode (first run compiles Rust - may take a minute)..." -ForegroundColor Cyan
+npm run dev
 
 Pop-Location
