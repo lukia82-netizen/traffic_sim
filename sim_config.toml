@@ -1,0 +1,26 @@
+# Runtime config for traffic_sim
+# Edit values and rerun the app (no rebuild needed).
+
+[simulation]
+# Fixed simulation step in seconds.
+fixed_dt = 0.016
+# Number of frames before graceful shutdown.
+max_frames = 300
+
+[intersection]
+# Distance from conflict point where a vehicle requests access.
+approach_radius = 1.0
+# Distance after crossing required to release intersection grant.
+clear_radius = 0.2
+# Waiting vehicles coast forward until this distance from the conflict point.
+stop_distance = 0.15
+
+[spawn]
+# Initial Y for north vehicle (moves toward negative Y).
+north_spawn_y = 4.0
+# Initial X for east vehicle (moves toward negative X).
+east_spawn_x = 4.0
+
+[vehicle]
+# Max vehicle speed units per second.
+max_speed = 1.0
