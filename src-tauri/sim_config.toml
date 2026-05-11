@@ -1,22 +1,24 @@
 [simulation]
-fixed_dt   = 0.016    # simulation step in seconds (ignored at runtime — wall-clock used)
-max_frames = 0    # 0 = run indefinitely
+fixed_dt   = 0.016    # simulation step in seconds (ignored at runtime - wall-clock used)
+max_frames = 0        # 0 = run indefinitely
 
 [intersection]
-approach_radius = 4   # distance from conflict point where a vehicle requests access
+approach_radius = 2.0   # distance from conflict point where a vehicle requests access
 clear_radius    = 0.2   # distance past conflict point required to release the grant
 
 [idm]
-a_max            = 1   # max acceleration [m/s²]
-b_comf           = 1.5   # comfortable braking [m/s²]
-delta            = 4   # acceleration exponent
+a_max            = 1.0   # max acceleration [m/s2]
+b_comf           = 1.5   # comfortable braking [m/s2]
+delta            = 4.0   # acceleration exponent
 s0               = 0.3   # minimum jam gap at standstill [units]
 t_headway        = 0.8   # safe time headway [s]
 stop_line_offset = 0.8   # distance before conflict point where Waiting vehicle targets to stop
+vehicle_length   = 0.2   # bumper-to-bumper correction [units]
 
 [spawn]
-north_spawn_y = 4   # initial Y for north vehicle
-east_spawn_x  = 4   # initial X for east vehicle
+num_vehicles    = 12     # vehicles to spawn (any number); N->E->S->W, extra ones queue behind on same lane
+spawn_distance  = 2.0   # distance from conflict point where each vehicle spawns [units]
+offmap_distance = 4.5   # distance past conflict point before vehicle is removed [units]
 
 [vehicle]
-max_speed = 1   # max vehicle speed [units/s]
+max_speed = 1.0   # max vehicle speed [units/s]

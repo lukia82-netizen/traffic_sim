@@ -81,10 +81,14 @@ struct SpawnSection {
     /// How far past the conflict point before a vehicle is removed.
     #[serde(default = "default_offmap_distance")]
     offmap_distance: f32,
+    /// How many vehicles to spawn (1–4), placed clockwise starting from North.
+    #[serde(default = "default_num_vehicles")]
+    num_vehicles: usize,
 }
 
 fn default_spawn_distance() -> f32 { 4.0 }
 fn default_offmap_distance() -> f32 { 4.5 }
+fn default_num_vehicles() -> usize { 4 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VehicleSection {
@@ -125,6 +129,7 @@ impl Default for SimulationConfig {
             spawn: SpawnSection {
                 spawn_distance: 4.0,
                 offmap_distance: 4.5,
+                num_vehicles: 4,
             },
             vehicle: VehicleSection { max_speed: 1.0 },
         }
@@ -170,6 +175,7 @@ impl SimulationConfig {
              stop_line_offset = {}   # distance before conflict point where Waiting vehicle targets to stop\n\
              vehicle_length   = {}   # bumper-to-bumper correction subtracted from center-to-center gap [units]\n\n\
              [spawn]\n\
+             num_vehicles    = {}   # number of vehicles to spawn: 1-4, clockwise from North\n\
              spawn_distance  = {}   # distance from conflict point where each vehicle spawns [units]\n\
              offmap_distance = {}   # distance past conflict point before vehicle is removed [units]\n\n\
              [vehicle]\n\
@@ -185,6 +191,7 @@ impl SimulationConfig {
             self.idm.t_headway,
             self.idm.stop_line_offset,
             self.idm.vehicle_length,
+            self.spawn.num_vehicles,
             self.spawn.spawn_distance,
             self.spawn.offmap_distance,
             self.vehicle.max_speed,
@@ -204,27 +211,35 @@ impl SimulationState {
     fn new(cfg: SimulationConfig) -> Self {
         let ms = cfg.vehicle.max_speed;
         let d = cfg.spawn.spawn_distance;
+        let n = cfg.spawn.num_vehicles.max(1);
 
-        // Each entry: (id, spawn_pos, approach_dir).
-        // All distances come from cfg — nothing hardcoded here.
-        let lane_defs: [(usize, Vec2, Vec2); 4] = [
-            (0, Vec2::new(0.0,  d), Vec2::new( 0.0, -1.0)), // North → south
-            (1, Vec2::new( d, 0.0), Vec2::new(-1.0,  0.0)), // East  → west
-            (2, Vec2::new(0.0, -d), Vec2::new( 0.0,  1.0)), // South → north
-            (3, Vec2::new(-d, 0.0), Vec2::new( 1.0,  0.0)), // West  → east
+        // Clockwise lane directions: N → E → S → W.
+        // approach_dir points toward the conflict point (into the intersection).
+        let lane_dirs: [Vec2; 4] = [
+            Vec2::new( 0.0, -1.0), // North lane → moves south
+            Vec2::new(-1.0,  0.0), // East  lane → moves west
+            Vec2::new( 0.0,  1.0), // South lane → moves north
+            Vec2::new( 1.0,  0.0), // West  lane → moves east
         ];
 
-        let vehicles = lane_defs
-            .iter()
-            .map(|&(id, pos, dir)| Vehicle {
-                id,
-                position: pos,
-                approach_dir: dir,
-                conflict_point: Vec2::ZERO,
-                max_speed: ms,
-                current_speed: 0.0,
-                acceleration: 0.0,
-                status: VehicleStatus::Cruising,
+        // Vehicle id=k → lane k%4, rank k/4.
+        // Rank 0 spawns at spawn_distance, rank 1 at 2*spawn_distance, etc.
+        // Spawn position = -approach_dir * spawn_distance * (rank + 1).
+        let vehicles = (0..n)
+            .map(|id| {
+                let dir = lane_dirs[id % 4];
+                let rank = (id / 4) as f32;
+                let pos = -dir * d * (rank + 1.0);
+                Vehicle {
+                    id,
+                    position: pos,
+                    approach_dir: dir,
+                    conflict_point: Vec2::ZERO,
+                    max_speed: ms,
+                    current_speed: 0.0,
+                    acceleration: 0.0,
+                    status: VehicleStatus::Cruising,
+                }
             })
             .collect();
         Self {
