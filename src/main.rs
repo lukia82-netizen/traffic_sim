@@ -1,9 +1,16 @@
 use bevy::app::AppExit;
+use bevy::color::palettes::css;
 use bevy::diagnostic::FrameCount;
+use bevy::math::Isometry2d;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path as StdPath;
+
+/// Simulation-unit → pixel multiplier for all gizmo drawing.
+const VISUAL_SCALE: f32 = 100.0;
+/// Radius (pixels) of a vehicle circle in the viewport.
+const VEHICLE_RADIUS_PX: f32 = 10.0;
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
@@ -174,7 +181,7 @@ impl SimulationConfig {
             return Err("clear_radius must be >= 0".to_string());
         }
         if cfg.vehicle.max_speed <= 0.0 {
-            return Err("vehicle_max_speed must be > 0".to_string());
+            return Err("max_speed must be > 0".to_string());
         }
         if cfg.idm.a_max <= 0.0 {
             return Err("idm.a_max must be > 0".to_string());
@@ -200,34 +207,22 @@ impl SimulationConfig {
             "# Runtime config for traffic_sim\n\
 # Edit values and rerun the app (no rebuild needed).\n\n\
 [simulation]\n\
-# Fixed simulation step in seconds.\n\
-fixed_dt = {}\n\
-# Number of frames before graceful shutdown.\n\
-max_frames = {}\n\n\
+fixed_dt   = {}    # simulation step in seconds\n\
+max_frames = {}    # frames before graceful shutdown\n\n\
 [intersection]\n\
-# Distance from conflict point where a vehicle requests access.\n\
-approach_radius = {}\n\
-# Distance after crossing required to release intersection grant.\n\
-clear_radius = {}\n\n\
+approach_radius = {}   # distance from conflict point where a vehicle requests access\n\
+clear_radius    = {}   # distance past conflict point required to release the grant\n\n\
 [spawn]\n\
-# Initial Y for north vehicle (moves toward negative Y).\n\
-north_spawn_y = {}\n\
-# Initial X for east vehicle (moves toward negative X).\n\
-east_spawn_x = {}\n\n\
+north_spawn_y = {}   # initial Y for north vehicle (moves toward negative Y)\n\
+east_spawn_x  = {}   # initial X for east vehicle (moves toward negative X)\n\n\
 [vehicle]\n\
-# Max vehicle speed units per second.\n\
-max_speed = {}\n\n\
+max_speed = {}   # max vehicle speed [units/s]\n\n\
 [idm]\n\
-# Maximum acceleration (m/s²).\n\
-a_max = {}\n\
-# Comfortable braking deceleration — clamps minimum acceleration (m/s²).\n\
-b_comf = {}\n\
-# Acceleration exponent.\n\
-delta = {}\n\
-# Minimum jam gap kept at standstill.\n\
-s0 = {}\n\
-# Safe time headway (s).\n\
-t_headway = {}\n",
+a_max     = {}   # max acceleration [m/s²]\n\
+b_comf    = {}   # comfortable braking — clamps minimum deceleration [m/s²]\n\
+delta     = {}   # acceleration exponent (IDM curve shape)\n\
+s0        = {}   # minimum jam gap at standstill [units]\n\
+t_headway = {}   # safe time headway [s]\n",
             self.simulation.fixed_dt,
             self.simulation.max_frames,
             self.intersection.approach_radius,
@@ -281,6 +276,12 @@ fn startup(mut commands: Commands, cfg: Res<SimulationConfig>) {
             approach_dir: Vec2::new(-1.0, 0.0),
         },
     ));
+}
+
+// ─── Camera Setup ─────────────────────────────────────────────────────────────
+
+fn setup_camera(mut commands: Commands) {
+    commands.spawn(Camera2d);
 }
 
 // ─── Intersection System (The Arbiter) ────────────────────────────────────────
@@ -383,28 +384,46 @@ fn movement_system(time: Res<Time>, mut q: Query<(&mut Position, &mut Vehicle, &
     }
 }
 
-// ─── Log + Termination System ─────────────────────────────────────────────────
+// ─── Termination System ───────────────────────────────────────────────────────
 
-fn log_system(
+fn termination_system(
     cfg: Res<SimulationConfig>,
     frame: Res<FrameCount>,
-    q: Query<(Entity, &Position, &Vehicle)>,
     mut app_exit: MessageWriter<AppExit>,
 ) {
-    println!("── Frame {:>4} ──────────────────────────────", frame.0);
-    for (entity, pos, vehicle) in q.iter() {
-        println!(
-            "  Entity {:?}  pos ({:6.3}, {:6.3})  speed {:5.3}  status {:?}",
-            entity, pos.0.x, pos.0.y, vehicle.current_speed, vehicle.status
-        );
-    }
-
     if frame.0 >= cfg.simulation.max_frames {
-        println!(
-            "Simulation complete after {} frames. Exiting.",
-            cfg.simulation.max_frames
-        );
         app_exit.write(AppExit::Success);
+    }
+}
+
+// ─── Gizmo Draw System ────────────────────────────────────────────────────────
+
+fn draw_gizmos_system(
+    mut gizmos: Gizmos,
+    cfg: Res<SimulationConfig>,
+    q: Query<(&Position, &Vehicle)>,
+) {
+    // ── Intersection marker: white cross at (0, 0) ──
+    let arm = 16.0_f32;
+    gizmos.line_2d(Vec2::new(-arm, 0.0), Vec2::new(arm, 0.0), css::WHITE);
+    gizmos.line_2d(Vec2::new(0.0, -arm), Vec2::new(0.0, arm), css::WHITE);
+
+    // ── Approach-radius ring (yellow) ──
+    let approach_px = cfg.intersection.approach_radius * VISUAL_SCALE;
+    gizmos.circle_2d(Isometry2d::IDENTITY, approach_px, css::YELLOW);
+
+    // ── Clear-radius ring (dim orange) ──
+    let clear_px = cfg.intersection.clear_radius * VISUAL_SCALE;
+    gizmos.circle_2d(Isometry2d::IDENTITY, clear_px, Color::srgb(1.0, 0.5, 0.0));
+
+    // ── Vehicles ──
+    for (pos, vehicle) in q.iter() {
+        let color: Color = match vehicle.status {
+            VehicleStatus::Waiting => css::RED.into(),
+            VehicleStatus::Cruising | VehicleStatus::Crossing => css::GREEN.into(),
+        };
+        let screen = pos.0 * VISUAL_SCALE;
+        gizmos.circle_2d(Isometry2d::from_translation(screen), VEHICLE_RADIUS_PX, color);
     }
 }
 
@@ -419,13 +438,27 @@ fn main() {
     );
 
     App::new()
-        .add_plugins(MinimalPlugins)
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "Traffic Sim – IDM".to_string(),
+                resolution: (800u32, 800u32).into(),
+                ..default()
+            }),
+            ..default()
+        }))
         .insert_resource(ConflictManager { granted: None })
         .insert_resource(sim_cfg)
-        .add_systems(Startup, startup)
+        .add_systems(Startup, (startup, setup_camera))
         .add_systems(
             Update,
-            (intersection_system, idm_system, movement_system, log_system).chain(),
+            (
+                intersection_system,
+                idm_system,
+                movement_system,
+                draw_gizmos_system,
+                termination_system,
+            )
+                .chain(),
         )
         .run();
 }

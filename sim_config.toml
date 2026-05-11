@@ -2,35 +2,23 @@
 # Edit values and rerun the app (no rebuild needed).
 
 [simulation]
-# Fixed simulation step in seconds.
-fixed_dt = 0.016
-# Number of frames before graceful shutdown.
-max_frames = 20000
+fixed_dt   = 0.016    # Krok symulacji w sekundach
+max_frames = 20000    # Liczba klatek po której aplikacja się zamknie
 
 [intersection]
-# Distance from conflict point where a vehicle requests access.
-approach_radius = 1.0
-# Distance after crossing required to release intersection grant.
-clear_radius = 0.2
+approach_radius = 1.5   # Odległość od punktu kolizji, od której pojazd zgłasza chęć wjazdu
+clear_radius    = 0.5   # Odległość za punktem kolizji potrzebna do zwolnienia przejazdu
 
 [spawn]
-# Initial Y for north vehicle (moves toward negative Y).
-north_spawn_y = 4.0
-# Initial X for east vehicle (moves toward negative X).
-east_spawn_x = 4.0
+north_spawn_y = 4.0   # Startowa pozycja Y pojazdu jadącego z północy (w dół)
+east_spawn_x  = 4.0   # Startowa pozycja X pojazdu jadącego ze wschodu (w lewo)
 
 [vehicle]
-# Max vehicle speed units per second.
-max_speed = 1.0
+max_speed = 1.0   # Maksymalna prędkość pojazdu [jednostki/s]
 
 [idm]
-# Maximum acceleration (m/s²).
-a_max = 1.5
-# Comfortable braking deceleration — clamps minimum acceleration (m/s²).
-b_comf = 2.0
-# Acceleration exponent.
-delta = 4.0
-# Minimum jam gap kept at standstill.
-s0 = 1.0
-# Safe time headway (s).
-t_headway = 1.5
+a_max     = 1.5   # Maksymalne przyspieszenie [m/s²]
+b_comf    = 1.5   # Komfortowe hamowanie — minimalny próg deceleracji [m/s²]
+delta     = 4.0   # Wykładnik przyspieszenia (kształt krzywej IDM)
+s0        = 1.0   # Minimalna luka w kolumnie przy postoju [jednostki]
+t_headway = 1.5   # Bezpieczny odstęp czasowy [s]
