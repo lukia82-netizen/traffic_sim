@@ -23,6 +23,8 @@ struct Position(Vec2);
 struct Vehicle {
     max_speed: f32,
     status: VehicleStatus,
+    current_speed: f32,
+    acceleration: f32,
 }
 
 /// Describes a vehicle's relationship to a single conflict point.
@@ -52,6 +54,7 @@ struct SimulationConfig {
     intersection: IntersectionSection,
     spawn: SpawnSection,
     vehicle: VehicleSection,
+    idm: IdmSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,8 +67,20 @@ struct SimulationSection {
 struct IntersectionSection {
     approach_radius: f32,
     clear_radius: f32,
-    /// Vehicles in Waiting state stop at this distance from the conflict point.
-    stop_distance: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IdmSection {
+    /// Max acceleration (m/s²).
+    a_max: f32,
+    /// Comfortable braking deceleration — clamps minimum acceleration (m/s²).
+    b_comf: f32,
+    /// Acceleration exponent.
+    delta: f32,
+    /// Minimum jam gap (distance kept at standstill).
+    s0: f32,
+    /// Safe time headway (s).
+    t_headway: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,13 +104,19 @@ impl Default for SimulationConfig {
             intersection: IntersectionSection {
                 approach_radius: 2.0,
                 clear_radius: 1.0,
-                stop_distance: 0.15,
             },
             spawn: SpawnSection {
                 north_spawn_y: 4.0,
                 east_spawn_x: 4.0,
             },
             vehicle: VehicleSection { max_speed: 1.0 },
+            idm: IdmSection {
+                a_max: 1.5,
+                b_comf: 2.0,
+                delta: 4.0,
+                s0: 1.0,
+                t_headway: 1.5,
+            },
         }
     }
 }
@@ -152,11 +173,23 @@ impl SimulationConfig {
         if cfg.intersection.clear_radius < 0.0 {
             return Err("clear_radius must be >= 0".to_string());
         }
-        if cfg.intersection.stop_distance < 0.0 {
-            return Err("stop_distance must be >= 0".to_string());
-        }
         if cfg.vehicle.max_speed <= 0.0 {
             return Err("vehicle_max_speed must be > 0".to_string());
+        }
+        if cfg.idm.a_max <= 0.0 {
+            return Err("idm.a_max must be > 0".to_string());
+        }
+        if cfg.idm.b_comf <= 0.0 {
+            return Err("idm.b_comf must be > 0".to_string());
+        }
+        if cfg.idm.delta <= 0.0 {
+            return Err("idm.delta must be > 0".to_string());
+        }
+        if cfg.idm.s0 <= 0.0 {
+            return Err("idm.s0 must be > 0".to_string());
+        }
+        if cfg.idm.t_headway <= 0.0 {
+            return Err("idm.t_headway must be > 0".to_string());
         }
 
         Ok(cfg)
@@ -175,9 +208,7 @@ max_frames = {}\n\n\
 # Distance from conflict point where a vehicle requests access.\n\
 approach_radius = {}\n\
 # Distance after crossing required to release intersection grant.\n\
-clear_radius = {}\n\
-# Waiting vehicles coast forward until this distance from the conflict point.\n\
-stop_distance = {}\n\n\
+clear_radius = {}\n\n\
 [spawn]\n\
 # Initial Y for north vehicle (moves toward negative Y).\n\
 north_spawn_y = {}\n\
@@ -185,15 +216,30 @@ north_spawn_y = {}\n\
 east_spawn_x = {}\n\n\
 [vehicle]\n\
 # Max vehicle speed units per second.\n\
-max_speed = {}\n",
+max_speed = {}\n\n\
+[idm]\n\
+# Maximum acceleration (m/s²).\n\
+a_max = {}\n\
+# Comfortable braking deceleration — clamps minimum acceleration (m/s²).\n\
+b_comf = {}\n\
+# Acceleration exponent.\n\
+delta = {}\n\
+# Minimum jam gap kept at standstill.\n\
+s0 = {}\n\
+# Safe time headway (s).\n\
+t_headway = {}\n",
             self.simulation.fixed_dt,
             self.simulation.max_frames,
             self.intersection.approach_radius,
             self.intersection.clear_radius,
-            self.intersection.stop_distance,
             self.spawn.north_spawn_y,
             self.spawn.east_spawn_x,
-            self.vehicle.max_speed
+            self.vehicle.max_speed,
+            self.idm.a_max,
+            self.idm.b_comf,
+            self.idm.delta,
+            self.idm.s0,
+            self.idm.t_headway,
         )
     }
 }
@@ -212,6 +258,8 @@ fn startup(mut commands: Commands, cfg: Res<SimulationConfig>) {
         Vehicle {
             max_speed: cfg.vehicle.max_speed,
             status: VehicleStatus::Cruising,
+            current_speed: 0.0,
+            acceleration: 0.0,
         },
         Path {
             conflict_point: Vec2::ZERO,
@@ -225,6 +273,8 @@ fn startup(mut commands: Commands, cfg: Res<SimulationConfig>) {
         Vehicle {
             max_speed: cfg.vehicle.max_speed,
             status: VehicleStatus::Cruising,
+            current_speed: 0.0,
+            acceleration: 0.0,
         },
         Path {
             conflict_point: Vec2::ZERO,
@@ -292,22 +342,44 @@ fn intersection_system(
     }
 }
 
+// ─── IDM System ───────────────────────────────────────────────────────────────
+
+fn idm_system(cfg: Res<SimulationConfig>, mut q: Query<(&Position, &mut Vehicle, &Path)>) {
+    for (pos, mut vehicle, path) in &mut q {
+        let v = vehicle.current_speed;
+        let v0 = vehicle.max_speed;
+        let idm = &cfg.idm;
+
+        // Dot-product guard: a vehicle past the conflict point must not apply
+        // the interaction term (it has already crossed and should accelerate freely).
+        let to_conflict = pos.0 - path.conflict_point;
+        let past_point = to_conflict.dot(path.approach_dir) > 0.0;
+
+        // Free-road term: accelerate toward v0.
+        let free_road = 1.0 - (v / v0).powf(idm.delta);
+
+        // Interaction term: only for Waiting vehicles still approaching.
+        let interaction = if vehicle.status == VehicleStatus::Waiting && !past_point {
+            let s = to_conflict.length().max(f32::EPSILON);
+            let s_star = idm.s0 + v * idm.t_headway;
+            (s_star / s).powi(2)
+        } else {
+            0.0
+        };
+
+        // Clamp deceleration floor to -b_comf to avoid numerical blow-up.
+        vehicle.acceleration = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
+    }
+}
+
 // ─── Movement System ──────────────────────────────────────────────────────────
 
-fn movement_system(cfg: Res<SimulationConfig>, mut q: Query<(&mut Position, &Vehicle, &Path)>) {
-    for (mut pos, vehicle, path) in &mut q {
-        match vehicle.status {
-            VehicleStatus::Cruising | VehicleStatus::Crossing => {
-                pos.0 += path.approach_dir * vehicle.max_speed * cfg.simulation.fixed_dt;
-            }
-            VehicleStatus::Waiting => {
-                // Coast forward until stop_distance from the conflict point.
-                let dist = pos.0.distance(path.conflict_point);
-                if dist > cfg.intersection.stop_distance {
-                    pos.0 += path.approach_dir * vehicle.max_speed * cfg.simulation.fixed_dt;
-                }
-            }
-        }
+fn movement_system(time: Res<Time>, mut q: Query<(&mut Position, &mut Vehicle, &Path)>) {
+    let dt = time.delta_secs();
+    for (mut pos, mut vehicle, path) in &mut q {
+        vehicle.current_speed = (vehicle.current_speed + vehicle.acceleration * dt)
+            .clamp(0.0, vehicle.max_speed);
+        pos.0 += path.approach_dir * vehicle.current_speed * dt;
     }
 }
 
@@ -322,8 +394,8 @@ fn log_system(
     println!("── Frame {:>4} ──────────────────────────────", frame.0);
     for (entity, pos, vehicle) in q.iter() {
         println!(
-            "  Entity {:?}  pos ({:6.3}, {:6.3})  status {:?}",
-            entity, pos.0.x, pos.0.y, vehicle.status
+            "  Entity {:?}  pos ({:6.3}, {:6.3})  speed {:5.3}  status {:?}",
+            entity, pos.0.x, pos.0.y, vehicle.current_speed, vehicle.status
         );
     }
 
@@ -353,7 +425,7 @@ fn main() {
         .add_systems(Startup, startup)
         .add_systems(
             Update,
-            (intersection_system, movement_system, log_system).chain(),
+            (intersection_system, idm_system, movement_system, log_system).chain(),
         )
         .run();
 }

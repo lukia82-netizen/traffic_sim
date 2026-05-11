@@ -5,15 +5,13 @@
 # Fixed simulation step in seconds.
 fixed_dt = 0.016
 # Number of frames before graceful shutdown.
-max_frames = 300
+max_frames = 20000
 
 [intersection]
 # Distance from conflict point where a vehicle requests access.
 approach_radius = 1.0
 # Distance after crossing required to release intersection grant.
 clear_radius = 0.2
-# Waiting vehicles coast forward until this distance from the conflict point.
-stop_distance = 0.21
 
 [spawn]
 # Initial Y for north vehicle (moves toward negative Y).
@@ -24,3 +22,15 @@ east_spawn_x = 4.0
 [vehicle]
 # Max vehicle speed units per second.
 max_speed = 1.0
+
+[idm]
+# Maximum acceleration (m/s²).
+a_max = 1.5
+# Comfortable braking deceleration — clamps minimum acceleration (m/s²).
+b_comf = 2.0
+# Acceleration exponent.
+delta = 4.0
+# Minimum jam gap kept at standstill.
+s0 = 1.0
+# Safe time headway (s).
+t_headway = 1.5
