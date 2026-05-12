@@ -21,7 +21,7 @@ const FRAME_DURATION: Duration = Duration::from_nanos((1_000_000_000.0 / TARGET_
 #[serde(rename_all = "lowercase")]
 enum VehicleStatus {
     Cruising,
-    Yielding, // waiting for right-hand vehicle
+    Stopped,  // held at red light
     Crossing,
 }
 
@@ -31,6 +31,29 @@ enum LaneId {
     South,
     East,
     West,
+}
+
+/// Traffic-light phase — cycles NS-green → all-red → EW-green → all-red → …
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LightPhase {
+    NSGreen,
+    AllRed1, // safety gap after NS green
+    EWGreen,
+    AllRed2, // safety gap after EW green
+}
+
+impl LightPhase {
+    fn next(self) -> Self {
+        match self {
+            LightPhase::NSGreen => LightPhase::AllRed1,
+            LightPhase::AllRed1 => LightPhase::EWGreen,
+            LightPhase::EWGreen => LightPhase::AllRed2,
+            LightPhase::AllRed2 => LightPhase::NSGreen,
+        }
+    }
+
+    fn ns_green(self) -> bool { matches!(self, LightPhase::NSGreen) }
+    fn ew_green(self) -> bool { matches!(self, LightPhase::EWGreen) }
 }
 
 // ─── Simulation data ──────────────────────────────────────────────────────────
@@ -47,17 +70,16 @@ struct Vehicle {
     acceleration: f32,
     status: VehicleStatus,
     leader_id: Option<usize>,
-    yielding_to_id: Option<usize>, // id of the right-hand vehicle this vehicle is yielding to
 }
 
-/// Half-width offset of each lane from road centre-line [world units = screen px / VISUAL_SCALE].
+/// Half-width offset of each lane from road centre-line [world units = px / VISUAL_SCALE].
 const LANE_OFFSET: f32 = 0.2;
 
 const ALL_LANES: [LaneId; 4] = [LaneId::North, LaneId::South, LaneId::East, LaneId::West];
 
 fn lane_direction(lane: LaneId) -> Vec2 {
     match lane {
-        LaneId::North => Vec2::new( 0.0, -1.0), // southbound (Y-up world coords)
+        LaneId::North => Vec2::new( 0.0, -1.0), // southbound
         LaneId::South => Vec2::new( 0.0,  1.0), // northbound
         LaneId::East  => Vec2::new(-1.0,  0.0), // westbound
         LaneId::West  => Vec2::new( 1.0,  0.0), // eastbound
@@ -73,23 +95,43 @@ fn lane_spawn_pos(lane: LaneId, dist: f32) -> Vec2 {
     }
 }
 
-/// Returns the lane that is immediately to the right of the given lane's heading direction.
-/// Used by the Right-Hand Rule yield logic.
-fn right_hand_lane(lane: LaneId) -> LaneId {
-    match lane {
-        LaneId::North => LaneId::West,  // heading S → right is W
-        LaneId::South => LaneId::East,  // heading N → right is E
-        LaneId::East  => LaneId::South, // heading W → right is S
-        LaneId::West  => LaneId::North, // heading E → right is N
-    }
+// ─── Traffic Light Manager ────────────────────────────────────────────────────
+
+struct TrafficLightManager {
+    phase:           LightPhase,
+    elapsed:         f32,
+    green_duration:  f32,
+    allred_duration: f32,
 }
 
-/// True when lanes `a` and `b` are on perpendicular roads (they conflict).
-fn lanes_cross(a: LaneId, b: LaneId) -> bool {
-    use LaneId::*;
-    let a_ns = matches!(a, North | South);
-    let b_ns = matches!(b, North | South);
-    a_ns != b_ns
+impl TrafficLightManager {
+    fn new(green_duration: f32, allred_duration: f32) -> Self {
+        Self {
+            phase: LightPhase::NSGreen,
+            elapsed: 0.0,
+            green_duration,
+            allred_duration,
+        }
+    }
+
+    fn tick(&mut self, dt: f32) {
+        self.elapsed += dt;
+        let phase_duration = match self.phase {
+            LightPhase::NSGreen | LightPhase::EWGreen => self.green_duration,
+            LightPhase::AllRed1 | LightPhase::AllRed2 => self.allred_duration,
+        };
+        if self.elapsed >= phase_duration {
+            self.elapsed -= phase_duration;
+            self.phase = self.phase.next();
+        }
+    }
+
+    fn is_green(&self, lane: LaneId) -> bool {
+        match lane {
+            LaneId::North | LaneId::South => self.phase.ns_green(),
+            LaneId::East  | LaneId::West  => self.phase.ew_green(),
+        }
+    }
 }
 
 // ─── Config types ─────────────────────────────────────────────────────────────
@@ -104,20 +146,26 @@ struct SimulationSection {
 struct IntersectionSection {
     approach_radius: f32,
     clear_radius: f32,
-    /// Distance from centre within which the right-hand rule activates [world units].
-    #[serde(default = "default_rh_critical_dist")]
-    right_hand_critical_dist: f32,
-    /// Max distance difference between A and B for tie-breaker to apply [world units].
-    #[serde(default = "default_rh_tiebreaker_dist")]
-    rh_tiebreaker_dist: f32,
-    /// If vehicle is within this distance from centre it never yields (escape hatch) [world units].
-    #[serde(default = "default_rh_escape_dist")]
-    rh_escape_dist: f32,
 }
 
-fn default_rh_critical_dist() -> f32 { 0.6 }
-fn default_rh_tiebreaker_dist() -> f32 { 0.15 }
-fn default_rh_escape_dist() -> f32 { 0.2 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrafficLightSection {
+    /// Duration of each green phase [seconds].
+    #[serde(default = "default_green_duration")]
+    green_duration: f32,
+    /// Duration of the all-red safety gap between green phases [seconds].
+    #[serde(default = "default_allred_duration")]
+    allred_duration: f32,
+}
+
+fn default_green_duration() -> f32 { 8.0 }
+fn default_allred_duration() -> f32 { 2.0 }
+
+impl Default for TrafficLightSection {
+    fn default() -> Self {
+        Self { green_duration: default_green_duration(), allred_duration: default_allred_duration() }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IdmSection {
@@ -127,7 +175,6 @@ struct IdmSection {
     s0: f32,
     t_headway: f32,
     stop_line_offset: f32,
-    /// Bumper-to-bumper correction: subtracted from center-to-center distance.
     #[serde(default = "default_vehicle_length")]
     vehicle_length: f32,
 }
@@ -136,13 +183,10 @@ fn default_vehicle_length() -> f32 { 0.2 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SpawnSection {
-    /// Distance from the conflict point where each vehicle is placed at start.
     #[serde(default = "default_spawn_distance")]
     spawn_distance: f32,
-    /// How far past the conflict point before a vehicle is removed.
     #[serde(default = "default_offmap_distance")]
     offmap_distance: f32,
-    /// How many vehicles to spawn (1–4), placed clockwise starting from North.
     #[serde(default = "default_num_vehicles")]
     num_vehicles: usize,
 }
@@ -158,42 +202,34 @@ struct VehicleSection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SimulationConfig {
-    simulation: SimulationSection,
-    intersection: IntersectionSection,
-    idm: IdmSection,
-    spawn: SpawnSection,
-    vehicle: VehicleSection,
+    simulation:     SimulationSection,
+    intersection:   IntersectionSection,
+    #[serde(default)]
+    traffic_lights: TrafficLightSection,
+    idm:            IdmSection,
+    spawn:          SpawnSection,
+    vehicle:        VehicleSection,
 }
 
 impl Default for SimulationConfig {
-    /// Fallback used ONLY when sim_config.toml is missing or unparseable.
-    /// Values here must stay in sync with sim_config.toml.
     fn default() -> Self {
         Self {
-            simulation: SimulationSection {
-                fixed_dt: 0.016,
-                max_frames: 0,
-            },
-            intersection: IntersectionSection {
-                approach_radius: 0.5,
-                clear_radius: 0.2,
-                right_hand_critical_dist: 0.6,
-                rh_tiebreaker_dist: 0.15,
-                rh_escape_dist: 0.2,
-            },
+            simulation: SimulationSection { fixed_dt: 0.016, max_frames: 0 },
+            intersection: IntersectionSection { approach_radius: 4.0, clear_radius: 0.8 },
+            traffic_lights: TrafficLightSection::default(),
             idm: IdmSection {
-                a_max: 1.0,
-                b_comf: 1.5,
+                a_max: 1.5,
+                b_comf: 3.0,
                 delta: 4.0,
-                s0: 0.3,
+                s0: 0.6,
                 t_headway: 0.8,
-                stop_line_offset: 0.2,
-                vehicle_length: 0.2,
+                stop_line_offset: 1.2,
+                vehicle_length: 0.4,
             },
             spawn: SpawnSection {
-                spawn_distance: 4.0,
-                offmap_distance: 4.5,
-                num_vehicles: 4,
+                spawn_distance: 5.0,
+                offmap_distance: 6.0,
+                num_vehicles: 16,
             },
             vehicle: VehicleSection { max_speed: 1.0 },
         }
@@ -225,24 +261,24 @@ impl SimulationConfig {
     fn to_toml_text(&self) -> String {
         format!(
             "[simulation]\n\
-             fixed_dt   = {}    # simulation step in seconds (ignored at runtime — wall-clock used)\n\
+             fixed_dt   = {}    # simulation step in seconds (ignored — wall-clock used)\n\
              max_frames = {}    # 0 = run indefinitely\n\n\
              [intersection]\n\
-             approach_radius = {}   # distance from conflict point where a vehicle requests access\n\
-             clear_radius    = {}   # distance past conflict point required to release the grant\n\
-             right_hand_critical_dist = {}   # right-hand rule activation radius [world units = px/100]\n\
-             rh_tiebreaker_dist       = {}   # max distance difference for tie-breaker to apply [world units]\n\
-             rh_escape_dist           = {}   # if vehicle is closer than this to centre, it never stops [world units]\n\n\
+             approach_radius = {}   # distance from conflict point for approach zone circle\n\
+             clear_radius    = {}   # distance past conflict point shown as clear zone\n\n\
+             [traffic_lights]\n\
+             green_duration  = {}   # duration of each green phase [seconds]\n\
+             allred_duration = {}   # all-red safety gap between phases [seconds]\n\n\
              [idm]\n\
              a_max            = {}   # max acceleration [m/s²]\n\
              b_comf           = {}   # comfortable braking [m/s²]\n\
              delta            = {}   # acceleration exponent\n\
              s0               = {}   # minimum jam gap at standstill [units]\n\
              t_headway        = {}   # safe time headway [s]\n\
-             stop_line_offset = {}   # distance before conflict point where Waiting vehicle targets to stop\n\
-             vehicle_length   = {}   # bumper-to-bumper correction subtracted from center-to-center gap [units]\n\n\
+             stop_line_offset = {}   # distance before conflict point where red vehicle stops\n\
+             vehicle_length   = {}   # bumper-to-bumper correction [units]\n\n\
              [spawn]\n\
-             num_vehicles    = {}   # number of vehicles to spawn: 1-4, clockwise from North\n\
+             num_vehicles    = {}   # total vehicles to spawn (random lane assignment)\n\
              spawn_distance  = {}   # distance from conflict point where each vehicle spawns [units]\n\
              offmap_distance = {}   # distance past conflict point before vehicle is removed [units]\n\n\
              [vehicle]\n\
@@ -251,9 +287,8 @@ impl SimulationConfig {
             self.simulation.max_frames,
             self.intersection.approach_radius,
             self.intersection.clear_radius,
-            self.intersection.right_hand_critical_dist,
-            self.intersection.rh_tiebreaker_dist,
-            self.intersection.rh_escape_dist,
+            self.traffic_lights.green_duration,
+            self.traffic_lights.allred_duration,
             self.idm.a_max,
             self.idm.b_comf,
             self.idm.delta,
@@ -273,7 +308,8 @@ impl SimulationConfig {
 
 struct SimulationState {
     vehicles: Vec<Vehicle>,
-    cfg: SimulationConfig,
+    lights:   TrafficLightManager,
+    cfg:      SimulationConfig,
 }
 
 impl SimulationState {
@@ -282,10 +318,9 @@ impl SimulationState {
         let ms = cfg.vehicle.max_speed;
         let d  = cfg.spawn.spawn_distance;
         let n  = cfg.spawn.num_vehicles.max(1);
+        let tl = &cfg.traffic_lights;
 
         let mut rng = rand::thread_rng();
-        // Track how many vehicles have already been assigned to each lane so
-        // subsequent vehicles spawn further back on the same lane.
         let mut lane_counts = [0usize; 4];
 
         let vehicles = (0..n)
@@ -307,25 +342,29 @@ impl SimulationState {
                     acceleration: 0.0,
                     status: VehicleStatus::Cruising,
                     leader_id: None,
-                    yielding_to_id: None,
                 }
             })
             .collect();
-        Self { vehicles, cfg }
+
+        Self {
+            vehicles,
+            lights: TrafficLightManager::new(tl.green_duration, tl.allred_duration),
+            cfg,
+        }
     }
 
     fn tick(&mut self, dt: f32) {
+        self.lights.tick(dt);
         self.idm_step();
         self.movement_step(dt);
         self.remove_finished();
     }
 
-    /// Returns true when all vehicles have left the map.
     fn is_finished(&self) -> bool {
         self.vehicles.is_empty()
     }
 
-    // ── IDM acceleration + yield logic ───────────────────────────────────────
+    // ── IDM acceleration with traffic-light control ───────────────────────────
 
     fn idm_step(&mut self) {
         let idm = self.cfg.idm.clone();
@@ -349,8 +388,7 @@ impl SimulationState {
                 .iter()
                 .filter(|(id, _, _, _, other_lane)| *id != v.id && *other_lane == v.lane_id)
                 .filter_map(|(lid, pos, _, leader_speed, _)| {
-                    let to_leader = *pos - v.position;
-                    let proj = to_leader.dot(v.approach_dir);
+                    let proj = (*pos - v.position).dot(v.approach_dir);
                     if proj > 0.0 { Some((*lid, proj, *leader_speed)) } else { None }
                 })
                 .min_by(|(_, a, _), (_, b, _)| a.partial_cmp(b).unwrap());
@@ -359,9 +397,9 @@ impl SimulationState {
 
             // ── Car-following interaction term ────────────────────────────────
             let car_following = if let Some((_, center_gap, leader_speed)) = leader {
-                let s       = (center_gap - idm.vehicle_length).max(f32::EPSILON);
+                let s      = (center_gap - idm.vehicle_length).max(f32::EPSILON);
                 let delta_v = speed - leader_speed;
-                let s_star  = idm.s0
+                let s_star = idm.s0
                     + (speed * idm.t_headway
                         + speed * delta_v / (2.0 * (idm.a_max * idm.b_comf).sqrt()))
                     .max(0.0);
@@ -370,58 +408,34 @@ impl SimulationState {
                 0.0
             };
 
-            // ── Right-Hand Rule yield logic ───────────────────────────────────
-            // A vehicle (A) must yield to the nearest vehicle (B) on its
-            // right-hand lane when B is within `right_hand_critical_dist` of
-            // the centre, unless A has already entered the intersection or A
-            // wins the ID-based tie-breaker (smaller ID → higher priority).
-            let to_conflict    = v.position - v.conflict_point; // conflict_point == (0,0)
+            // ── Traffic-light stop-line term ──────────────────────────────────
+            // When the lane is RED and the vehicle has not yet crossed the
+            // stop line, treat it as a virtual stationary leader.
+            // Vehicles that are already past the stop line (committed to the
+            // intersection) must clear it regardless of the current light state.
+            let to_conflict    = v.position - v.conflict_point; // conflict_point = (0,0)
             let past_point     = to_conflict.dot(v.approach_dir) > 0.0;
-            let dist_to_center = v.position.length();
-            let in_intersection = dist_to_center < self.cfg.intersection.rh_escape_dist;
-            let critical_dist  = self.cfg.intersection.right_hand_critical_dist;
-            let tiebreaker_dist = self.cfg.intersection.rh_tiebreaker_dist;
+            let lane_green     = self.lights.is_green(v.lane_id);
+            let dist_to_stop   = to_conflict.length() - idm.stop_line_offset;
+            let past_stop_line = dist_to_stop <= 0.0; // already inside the box
 
-            let my_right_lane  = right_hand_lane(v.lane_id);
-            let right_vehicle  = snapshot.iter()
-                .filter(|(id, _, _, _, lane)| *id != v.id && *lane == my_right_lane)
-                .min_by(|(_, pa, ..), (_, pb, ..)| {
-                    pa.length().partial_cmp(&pb.length()).unwrap()
-                });
-
-            // A yields when: B is within critical distance, A hasn't entered
-            // the intersection yet, and B beats A in the priority check.
-            // Tie-breaker: when both are at similar distances, smaller ID wins.
-            let (rh_yield, rh_yield_target) = if let Some((rh_id, rh_pos, ..)) = right_vehicle {
-                let rh_dist = rh_pos.length();
-                if rh_dist < critical_dist && !past_point && !in_intersection {
-                    let similar_dist = (dist_to_center - rh_dist).abs() < tiebreaker_dist;
-                    let a_wins = similar_dist && v.id < *rh_id;
-                    (!a_wins, if !a_wins { Some(*rh_id) } else { None })
-                } else {
-                    (false, None)
-                }
-            } else {
-                (false, None)
-            };
-
-            let yield_interaction = if rh_yield {
-                let s      = (dist_to_center - idm.stop_line_offset).max(f32::EPSILON);
+            let tl_interaction = if !lane_green && !past_point && !past_stop_line {
+                let s      = dist_to_stop.max(f32::EPSILON);
                 let s_star = idm.s0 + speed * idm.t_headway;
                 (s_star / s).powi(2)
             } else {
                 0.0
             };
 
-            // Worst-case braking wins.
-            let interaction = car_following.max(yield_interaction);
+            // Worst-case interaction wins (car-following or red light).
+            let interaction = car_following.max(tl_interaction);
             v.acceleration  = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
 
-            // ── Status update ─────────────────────────────────────────────────
-            v.yielding_to_id = rh_yield_target;
-            v.status = if rh_yield {
-                VehicleStatus::Yielding
-            } else if past_point && dist_to_center < self.cfg.intersection.clear_radius * 3.0 {
+            // ── Status ────────────────────────────────────────────────────────
+            let dist_to_center = v.position.length();
+            v.status = if !lane_green && !past_point && !past_stop_line {
+                VehicleStatus::Stopped
+            } else if (past_point || past_stop_line) && dist_to_center < self.cfg.intersection.clear_radius * 3.0 {
                 VehicleStatus::Crossing
             } else {
                 VehicleStatus::Cruising
@@ -464,11 +478,13 @@ impl SimulationState {
                     speed: v.current_speed,
                     accel: v.acceleration,
                     leader_id: v.leader_id,
-                    yielding_to_id: v.yielding_to_id,
                 })
                 .collect(),
-            approach_radius: self.cfg.intersection.approach_radius,
-            clear_radius: self.cfg.intersection.clear_radius,
+            approach_radius:  self.cfg.intersection.approach_radius,
+            clear_radius:     self.cfg.intersection.clear_radius,
+            stop_line_offset: self.cfg.idm.stop_line_offset,
+            light_ns: self.lights.phase.ns_green(),
+            light_ew: self.lights.phase.ew_green(),
         }
     }
 }
@@ -486,21 +502,22 @@ struct VehicleFrame {
     speed: f32,
     accel: f32,
     leader_id: Option<usize>,
-    yielding_to_id: Option<usize>,
 }
 
 #[derive(Serialize, Clone)]
 struct SimFrame {
-    vehicles: Vec<VehicleFrame>,
-    approach_radius: f32,
-    clear_radius: f32,
+    vehicles:         Vec<VehicleFrame>,
+    approach_radius:  f32,
+    clear_radius:     f32,
+    stop_line_offset: f32,
+    light_ns:         bool,
+    light_ew:         bool,
 }
 
 // ─── Tauri commands ───────────────────────────────────────────────────────────
 
 type SharedState = Arc<Mutex<SimulationState>>;
 
-/// Returns the current simulation frame on demand (optional polling path).
 #[tauri::command]
 fn get_simulation_frame(state: tauri::State<SharedState>) -> SimFrame {
     state.lock().unwrap().to_frame()
@@ -532,7 +549,6 @@ fn start_simulation_loop(app_handle: AppHandle, state: SharedState) {
                 break;
             }
 
-            // Sleep for the remainder of the frame budget.
             let elapsed = last.elapsed();
             if elapsed < FRAME_DURATION {
                 thread::sleep(FRAME_DURATION - elapsed);
