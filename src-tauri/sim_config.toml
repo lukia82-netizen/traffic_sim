@@ -3,21 +3,24 @@ fixed_dt   = 0.016    # simulation step in seconds (ignored at runtime - wall-cl
 max_frames = 0        # 0 = run indefinitely
 
 [intersection]
-approach_radius = 2.0   # distance from conflict point where a vehicle requests access
-clear_radius    = 0.5   # distance past conflict point required to release the grantright_hand_critical_dist = 0.6   # right-hand rule activation radius [world units = px/100]
+approach_radius          = 4.0   # distance from conflict point where a vehicle requests access
+clear_radius             = 0.8   # distance past conflict point required to release the grant
+right_hand_critical_dist = 2.5   # right-hand rule activation radius [world units = px/100]
+rh_tiebreaker_dist       = 0.3  # max distance difference for tie-breaker to apply [world units]
+rh_escape_dist           = 0.6   # if vehicle is closer than this to centre, it never stops [world units]
 [idm]
-a_max            = 1.0   # max acceleration [m/s2]
-b_comf           = 1.5   # comfortable braking [m/s2]
+a_max            = 1.5   # max acceleration [m/s2]
+b_comf           = 3.0   # comfortable braking [m/s2]
 delta            = 4.0   # acceleration exponent
-s0               = 0.3   # minimum jam gap at standstill [units]
+s0               = 0.6   # minimum jam gap at standstill [units]
 t_headway        = 0.8   # safe time headway [s]
-stop_line_offset = 1.5   # distance before conflict point where Waiting vehicle targets to stop
-vehicle_length   = 0.2   # bumper-to-bumper correction [units]
+stop_line_offset = 1.2   # distance before conflict point where Waiting vehicle targets to stop
+vehicle_length   = 0.4   # bumper-to-bumper correction [units]
 
 [spawn]
 num_vehicles    = 16     # vehicles to spawn (any number); N->E->S->W, extra ones queue behind on same lane
-spawn_distance  = 2.0   # distance from conflict point where each vehicle spawns [units]
-offmap_distance = 4.5   # distance past conflict point before vehicle is removed [units]
+spawn_distance  = 5.0   # distance from conflict point where each vehicle spawns [units]
+offmap_distance = 6.0   # distance past conflict point before vehicle is removed [units]
 
 [vehicle]
 max_speed = 1.0   # max vehicle speed [units/s]
