@@ -66,26 +66,50 @@ async function main() {
 
   function drawStaticScene(approachRadius, clearRadius) {
     sceneLayer.clear();
-    const ap = approachRadius * VISUAL_SCALE;
-    const cr = clearRadius * VISUAL_SCALE;
 
+    const ROAD_W   = 80;  // total road width in canvas pixels (each lane = 40 px)
+    const DASH_LEN = 15;
+    const GAP_LEN  = 10;
+
+    // ── Road bodies ───────────────────────────────────────────────────────────
+    // N-S road (vertical strip centred on x = CENTER)
+    sceneLayer
+      .rect(CENTER - ROAD_W / 2, 0, ROAD_W, CANVAS_SIZE)
+      .fill({ color: 0x2a2a2a });
+    // E-W road (horizontal strip centred on y = CENTER)
+    sceneLayer
+      .rect(0, CENTER - ROAD_W / 2, CANVAS_SIZE, ROAD_W)
+      .fill({ color: 0x2a2a2a });
+    // Intersection box (slightly lighter so the cross reads clearly)
+    sceneLayer
+      .rect(CENTER - ROAD_W / 2, CENTER - ROAD_W / 2, ROAD_W, ROAD_W)
+      .fill({ color: 0x383838 });
+
+    // ── Dashed yellow centre-lines ────────────────────────────────────────────
+    // N-S centreline (vertical dashes at x = CENTER, separating the two lanes)
+    for (let y = 0; y < CANVAS_SIZE; y += DASH_LEN + GAP_LEN) {
+      sceneLayer
+        .moveTo(CENTER, y)
+        .lineTo(CENTER, Math.min(y + DASH_LEN, CANVAS_SIZE))
+        .stroke({ width: 2, color: 0xffee00, alpha: 0.85 });
+    }
+    // E-W centreline (horizontal dashes at y = CENTER)
+    for (let x = 0; x < CANVAS_SIZE; x += DASH_LEN + GAP_LEN) {
+      sceneLayer
+        .moveTo(x, CENTER)
+        .lineTo(Math.min(x + DASH_LEN, CANVAS_SIZE), CENTER)
+        .stroke({ width: 2, color: 0xffee00, alpha: 0.85 });
+    }
+
+    // ── Approach / clear-zone circles (reference overlay) ─────────────────────
+    const ap = approachRadius * VISUAL_SCALE;
+    const cr = clearRadius   * VISUAL_SCALE;
     sceneLayer
       .circle(CENTER, CENTER, ap)
-      .stroke({ width: 1.5, color: COLOR.approach, alpha: 0.7 });
-
+      .stroke({ width: 1.5, color: COLOR.approach, alpha: 0.5 });
     sceneLayer
       .circle(CENTER, CENTER, cr)
-      .stroke({ width: 1.5, color: COLOR.clear, alpha: 0.7 });
-
-    const arm = 20;
-    sceneLayer
-      .moveTo(CENTER - arm, CENTER)
-      .lineTo(CENTER + arm, CENTER)
-      .stroke({ width: 2, color: COLOR.cross });
-    sceneLayer
-      .moveTo(CENTER, CENTER - arm)
-      .lineTo(CENTER, CENTER + arm)
-      .stroke({ width: 2, color: COLOR.cross });
+      .stroke({ width: 1.5, color: COLOR.clear, alpha: 0.5 });
   }
 
   // 5. Debug layer (laser lines — rendered below vehicles)

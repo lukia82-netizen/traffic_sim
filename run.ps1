@@ -9,7 +9,7 @@ if (-not ($env:PATH -split ";" | Where-Object { $_ -eq $mingwBin })) {
 $projectDir = $PSScriptRoot
 Push-Location $projectDir
 
-$configPath = Join-Path $projectDir "sim_config.toml"
+$configPath = Join-Path $projectDir "src-tauri\sim_config.toml"
 
 function Get-TomlScalar {
     param([string]$Text, [string]$Key)

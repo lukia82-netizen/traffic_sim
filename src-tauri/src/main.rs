@@ -25,6 +25,14 @@ enum VehicleStatus {
     Crossing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LaneId {
+    North,
+    South,
+    East,
+    West,
+}
+
 // ─── Simulation data ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -32,6 +40,7 @@ struct Vehicle {
     id: usize,
     position: Vec2,
     approach_dir: Vec2,
+    lane_id: LaneId,
     conflict_point: Vec2,
     max_speed: f32,
     current_speed: f32,
@@ -40,9 +49,37 @@ struct Vehicle {
     leader_id: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
-struct ConflictManager {
-    granted: Option<usize>,
+/// Half-width offset of each lane from road centre-line [world units = screen px / VISUAL_SCALE].
+const LANE_OFFSET: f32 = 0.2;
+/// Radius around (0,0) within which yield logic activates [world units = 50 screen px / 100].
+const YIELD_RADIUS: f32 = 0.5;
+
+const ALL_LANES: [LaneId; 4] = [LaneId::North, LaneId::South, LaneId::East, LaneId::West];
+
+fn lane_direction(lane: LaneId) -> Vec2 {
+    match lane {
+        LaneId::North => Vec2::new( 0.0, -1.0), // southbound (Y-up world coords)
+        LaneId::South => Vec2::new( 0.0,  1.0), // northbound
+        LaneId::East  => Vec2::new(-1.0,  0.0), // westbound
+        LaneId::West  => Vec2::new( 1.0,  0.0), // eastbound
+    }
+}
+
+fn lane_spawn_pos(lane: LaneId, dist: f32) -> Vec2 {
+    match lane {
+        LaneId::North => Vec2::new( LANE_OFFSET,  dist),
+        LaneId::South => Vec2::new(-LANE_OFFSET, -dist),
+        LaneId::East  => Vec2::new( dist, -LANE_OFFSET),
+        LaneId::West  => Vec2::new(-dist,  LANE_OFFSET),
+    }
+}
+
+/// True when lanes `a` and `b` are on perpendicular roads (they conflict).
+fn lanes_cross(a: LaneId, b: LaneId) -> bool {
+    use LaneId::*;
+    let a_ns = matches!(a, North | South);
+    let b_ns = matches!(b, North | South);
+    a_ns != b_ns
 }
 
 // ─── Config types ─────────────────────────────────────────────────────────────
@@ -138,7 +175,7 @@ impl Default for SimulationConfig {
 }
 
 impl SimulationConfig {
-    const FILE_PATH: &'static str = "sim_config.toml";
+    const FILE_PATH: &'static str = "src-tauri/sim_config.toml";
 
     fn load_or_create() -> Self {
         let path = StdPath::new(Self::FILE_PATH);
@@ -204,37 +241,34 @@ impl SimulationConfig {
 
 struct SimulationState {
     vehicles: Vec<Vehicle>,
-    manager: ConflictManager,
     cfg: SimulationConfig,
 }
 
 impl SimulationState {
     fn new(cfg: SimulationConfig) -> Self {
+        use rand::Rng;
         let ms = cfg.vehicle.max_speed;
-        let d = cfg.spawn.spawn_distance;
-        let n = cfg.spawn.num_vehicles.max(1);
+        let d  = cfg.spawn.spawn_distance;
+        let n  = cfg.spawn.num_vehicles.max(1);
 
-        // Clockwise lane directions: N → E → S → W.
-        // approach_dir points toward the conflict point (into the intersection).
-        let lane_dirs: [Vec2; 4] = [
-            Vec2::new( 0.0, -1.0), // North lane → moves south
-            Vec2::new(-1.0,  0.0), // East  lane → moves west
-            Vec2::new( 0.0,  1.0), // South lane → moves north
-            Vec2::new( 1.0,  0.0), // West  lane → moves east
-        ];
+        let mut rng = rand::thread_rng();
+        // Track how many vehicles have already been assigned to each lane so
+        // subsequent vehicles spawn further back on the same lane.
+        let mut lane_counts = [0usize; 4];
 
-        // Vehicle id=k → lane k%4, rank k/4.
-        // Rank 0 spawns at spawn_distance, rank 1 at 2*spawn_distance, etc.
-        // Spawn position = -approach_dir * spawn_distance * (rank + 1).
         let vehicles = (0..n)
             .map(|id| {
-                let dir = lane_dirs[id % 4];
-                let rank = (id / 4) as f32;
-                let pos = -dir * d * (rank + 1.0);
+                let lane_idx = rng.gen_range(0..4usize);
+                let lane     = ALL_LANES[lane_idx];
+                let rank     = lane_counts[lane_idx];
+                lane_counts[lane_idx] += 1;
+                let dir = lane_direction(lane);
+                let pos = lane_spawn_pos(lane, d * (rank as f32 + 1.0));
                 Vehicle {
                     id,
                     position: pos,
                     approach_dir: dir,
+                    lane_id: lane,
                     conflict_point: Vec2::ZERO,
                     max_speed: ms,
                     current_speed: 0.0,
@@ -244,15 +278,10 @@ impl SimulationState {
                 }
             })
             .collect();
-        Self {
-            vehicles,
-            manager: ConflictManager { granted: None },
-            cfg,
-        }
+        Self { vehicles, cfg }
     }
 
     fn tick(&mut self, dt: f32) {
-        self.intersection_step();
         self.idm_step();
         self.movement_step(dt);
         self.remove_finished();
@@ -263,105 +292,43 @@ impl SimulationState {
         self.vehicles.is_empty()
     }
 
-    // ── Conflict arbiter ──────────────────────────────────────────────────────
-
-    fn intersection_step(&mut self) {
-        // Step A: release grant if crossing vehicle has cleared the zone.
-        if let Some(granted_id) = self.manager.granted {
-            if let Some(v) = self.vehicles.iter_mut().find(|v| v.id == granted_id) {
-                let to_conflict = v.position - v.conflict_point;
-                let past_point = to_conflict.dot(v.approach_dir) > 0.0;
-                let far_enough = to_conflict.length() > self.cfg.intersection.clear_radius;
-                if past_point && far_enough {
-                    v.status = VehicleStatus::Cruising;
-                    self.manager.granted = None;
-                }
-            } else {
-                self.manager.granted = None;
-            }
-        }
-
-        // Step B: collect approaching (not-yet-past) vehicles sorted by id.
-        let approach_radius = self.cfg.intersection.approach_radius;
-        let mut approaching: Vec<usize> = self
-            .vehicles
-            .iter()
-            .filter_map(|v| {
-                let to_conflict = v.position - v.conflict_point;
-                let past_point = to_conflict.dot(v.approach_dir) > 0.0;
-                let dist = to_conflict.length();
-                if dist < approach_radius && !past_point {
-                    Some(v.id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        approaching.sort_unstable();
-
-        // Step C: lowest id wins the grant.
-        if self.manager.granted.is_none() {
-            if let Some(&winner_id) = approaching.first() {
-                self.manager.granted = Some(winner_id);
-                if let Some(v) = self.vehicles.iter_mut().find(|v| v.id == winner_id) {
-                    v.status = VehicleStatus::Crossing;
-                }
-            }
-        }
-
-        // Step D: all other approaching vehicles wait.
-        let granted = self.manager.granted;
-        for v in &mut self.vehicles {
-            if approaching.contains(&v.id) && Some(v.id) != granted {
-                v.status = VehicleStatus::Waiting;
-            }
-        }
-    }
-
-    // ── IDM acceleration ──────────────────────────────────────────────────────
+    // ── IDM acceleration + yield logic ───────────────────────────────────────
 
     fn idm_step(&mut self) {
         let idm = self.cfg.idm.clone();
 
-        // Snapshot: (id, position, approach_dir, current_speed).
-        let snapshot: Vec<(usize, Vec2, Vec2, f32)> = self
+        // Snapshot: (id, position, approach_dir, current_speed, lane_id).
+        let snapshot: Vec<(usize, Vec2, Vec2, f32, LaneId)> = self
             .vehicles
             .iter()
-            .map(|v| (v.id, v.position, v.approach_dir, v.current_speed))
+            .map(|v| (v.id, v.position, v.approach_dir, v.current_speed, v.lane_id))
             .collect();
 
         for v in &mut self.vehicles {
             let speed = v.current_speed;
-            let v0 = v.max_speed;
+            let v0    = v.max_speed;
 
             // ── Free-road term ────────────────────────────────────────────────
             let free_road = 1.0 - (speed / v0).powf(idm.delta);
 
-            // ── Leader search: same lane, closest vehicle ahead ───────────────
+            // ── Leader search: same lane only ─────────────────────────────────
             let leader = snapshot
                 .iter()
-                .filter(|(id, _, dir, _)| {
-                    *id != v.id && dir.dot(v.approach_dir) > 0.99
-                })
-                .filter_map(|(lid, pos, _, leader_speed)| {
+                .filter(|(id, _, _, _, other_lane)| *id != v.id && *other_lane == v.lane_id)
+                .filter_map(|(lid, pos, _, leader_speed, _)| {
                     let to_leader = *pos - v.position;
                     let proj = to_leader.dot(v.approach_dir);
-                    if proj > 0.0 {
-                        Some((*lid, proj, *leader_speed))
-                    } else {
-                        None
-                    }
+                    if proj > 0.0 { Some((*lid, proj, *leader_speed)) } else { None }
                 })
                 .min_by(|(_, a, _), (_, b, _)| a.partial_cmp(b).unwrap());
 
-            // Store the leader id for debug rendering.
             v.leader_id = leader.map(|(lid, _, _)| lid);
 
             // ── Car-following interaction term ────────────────────────────────
             let car_following = if let Some((_, center_gap, leader_speed)) = leader {
-                let s = (center_gap - idm.vehicle_length).max(f32::EPSILON);
+                let s       = (center_gap - idm.vehicle_length).max(f32::EPSILON);
                 let delta_v = speed - leader_speed;
-                let s_star = idm.s0
+                let s_star  = idm.s0
                     + (speed * idm.t_headway
                         + speed * delta_v / (2.0 * (idm.a_max * idm.b_comf).sqrt()))
                     .max(0.0);
@@ -370,23 +337,41 @@ impl SimulationState {
                 0.0
             };
 
-            // ── Intersection interaction term ─────────────────────────────────
-            // Treat the stop line as a virtual stationary leader for Waiting
-            // vehicles that have not yet crossed the conflict point.
-            let to_conflict = v.position - v.conflict_point;
-            let past_point = to_conflict.dot(v.approach_dir) > 0.0;
+            // ── Yield logic ───────────────────────────────────────────────────
+            // Before entering the centre (0,0), yield if any vehicle on a
+            // crossing lane is already within YIELD_RADIUS of centre.
+            let to_conflict   = v.position - v.conflict_point; // conflict_point == (0,0)
+            let past_point    = to_conflict.dot(v.approach_dir) > 0.0;
+            let dist_to_center = v.position.length();
 
-            let intersection = if v.status == VehicleStatus::Waiting && !past_point {
-                let s = (to_conflict.length() - idm.stop_line_offset).max(f32::EPSILON);
+            let yield_blocked = !past_point
+                && dist_to_center < YIELD_RADIUS
+                && snapshot.iter().any(|(other_id, other_pos, _, _, other_lane)| {
+                    *other_id != v.id
+                        && lanes_cross(v.lane_id, *other_lane)
+                        && other_pos.length() < YIELD_RADIUS
+                });
+
+            let yield_interaction = if yield_blocked {
+                let s      = (dist_to_center - idm.stop_line_offset).max(f32::EPSILON);
                 let s_star = idm.s0 + speed * idm.t_headway;
                 (s_star / s).powi(2)
             } else {
                 0.0
             };
 
-            // Worst-case (most braking) wins.
-            let interaction = car_following.max(intersection);
-            v.acceleration = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
+            // Worst-case braking wins.
+            let interaction = car_following.max(yield_interaction);
+            v.acceleration  = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
+
+            // ── Status update ─────────────────────────────────────────────────
+            v.status = if yield_blocked {
+                VehicleStatus::Waiting
+            } else if past_point && dist_to_center < self.cfg.intersection.clear_radius * 3.0 {
+                VehicleStatus::Crossing
+            } else {
+                VehicleStatus::Cruising
+            };
         }
     }
 
@@ -405,15 +390,9 @@ impl SimulationState {
         let offmap = self.cfg.spawn.offmap_distance;
         self.vehicles.retain(|v| {
             let to_conflict = v.position - v.conflict_point;
-            let past_point = to_conflict.dot(v.approach_dir) > 0.0;
+            let past_point  = to_conflict.dot(v.approach_dir) > 0.0;
             !(past_point && to_conflict.length() > offmap)
         });
-        // If the removed vehicle held the grant, clear it.
-        if let Some(id) = self.manager.granted {
-            if !self.vehicles.iter().any(|v| v.id == id) {
-                self.manager.granted = None;
-            }
-        }
     }
 
     fn to_frame(&self) -> SimFrame {
