@@ -6,6 +6,11 @@ if (-not ($env:PATH -split ";" | Where-Object { $_ -eq $mingwBin })) {
     $env:PATH = "$mingwBin;" + $env:PATH
 }
 
+$llvmBin = "C:\Program Files\LLVM\bin"
+if (-not ($env:PATH -split ";" | Where-Object { $_ -eq $llvmBin })) {
+    $env:PATH = "$llvmBin;" + $env:PATH
+}
+
 $projectDir = $PSScriptRoot
 Push-Location $projectDir
 

@@ -17,7 +17,9 @@ toml = "0.8"
 [profile.dev]
 incremental = true
 opt-level = 0
-debug = true
+debug = 1
+codegen-units = 16
+split-debuginfo = "unpacked"
 
 [profile.release]
 codegen-units = 1

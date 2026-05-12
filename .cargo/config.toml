@@ -1,2 +1,10 @@
 [build]
 target-dir = "C:\\cargo-target\\traffic_sim"
+
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+    "-C", "link-arg=-fuse-ld=lld",
+]
+
+[env]
+CARGO_INCREMENTAL = "1"

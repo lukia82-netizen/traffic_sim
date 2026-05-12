@@ -3,8 +3,9 @@ fixed_dt   = 0.016    # simulation step in seconds (ignored at runtime - wall-cl
 max_frames = 0        # 0 = run indefinitely
 
 [intersection]
-approach_radius = 4.0   # radius of approach zone circle shown on screen
-clear_radius    = 0.8   # radius of clear zone circle shown on screen
+approach_radius     = 4.0   # radius of approach zone circle shown on screen
+clear_radius        = 0.8   # radius of clear zone circle shown on screen
+oncoming_clear_dist = 3.0   # oncoming vehicle within this distance from centre blocks a left-turn [units]
 
 [traffic_lights]
 green_duration  = 8.0   # duration of each green phase [seconds]
@@ -20,9 +21,10 @@ stop_line_offset = 1.2   # distance before conflict point where red vehicle stop
 vehicle_length   = 0.4   # bumper-to-bumper correction [units]
 
 [spawn]
-num_vehicles    = 16    # total vehicles to spawn (random lane assignment)
-spawn_distance  = 5.0   # distance from conflict point where each vehicle spawns [units]
-offmap_distance = 6.0   # distance past conflict point before vehicle is removed [units]
+num_vehicles           = 16    # total vehicles to spawn (random lane assignment)
+spawn_distance         = 5.0   # distance from conflict point where each vehicle spawns [units]
+offmap_distance        = 6.0   # distance past conflict point before vehicle is removed [units]
+left_turn_probability  = 0.20  # fraction of vehicles assigned a left-turn intent [0.0 – 1.0]
 
 [vehicle]
 max_speed = 1.0   # max vehicle speed [units/s]

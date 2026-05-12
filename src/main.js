@@ -9,14 +9,17 @@ const CENTER        = CANVAS_SIZE / 2;
 const ROAD_HALF_PX  = 0.5 * VISUAL_SCALE; // draw stop lines spanning ±0.5 world units
 
 const COLOR = {
-  cruising:  0x00cc44,
-  crossing:  0x44aaff,
-  stopped:   0xff2222,
-  approach:  0xffee00,
-  clear:     0xff8800,
-  cross:     0xffffff,
-  label:     0xffff00,
-  stopLine:  0xffffff,
+  cruising:   0x00cc44,
+  crossing:   0x44aaff,
+  stopped:    0xff2222,
+  yielding:   0xff9900,  // left-turner waiting for oncoming gap
+  approach:   0xffee00,
+  clear:      0xff8800,
+  cross:      0xffffff,
+  label:      0xffff00,
+  stopLine:   0xffffff,
+  blinker:    0xffdd00,  // left-turn indicator dot
+  oncomingLine: 0xff6600,
   lightGreen: 0x00ee44,
   lightRed:   0xee2222,
   lightOff:   0x333333,
@@ -190,6 +193,7 @@ async function main() {
   function vehicleColor(status) {
     if (status === "stopped")  return COLOR.stopped;
     if (status === "crossing") return COLOR.crossing;
+    if (status === "yielding") return COLOR.yielding;
     return COLOR.cruising;
   }
 
@@ -208,8 +212,18 @@ async function main() {
     const dy = -v.dir_y * arrowLen;
     g.moveTo(sx, sy).lineTo(sx + dx, sy + dy).stroke({ width: 2, color: 0xffffff, alpha: 0.6 });
 
+    // Left-turn blinker: yellow dot on the LEFT side of the vehicle.
+    // Left side in screen space: offset = (-dir_y, -dir_x) * blinker_dist
+    if (v.intent === "left") {
+      const bd  = VEHICLE_RADIUS * 1.1;
+      const blx = sx - v.dir_y * bd;
+      const bly = sy - v.dir_x * bd;
+      g.circle(blx, bly, 4).fill({ color: COLOR.blinker, alpha: 0.95 });
+    }
+
+    const intentTag = v.intent === "left" ? " ↰" : "";
     label.text =
-      "#" + v.id + " " + v.status.toUpperCase() + "\n" +
+      "#" + v.id + " " + v.status.toUpperCase() + intentTag + "\n" +
       "V:" + v.speed.toFixed(2) + " A:" + v.accel.toFixed(2);
     label.x = sx;
     label.y = sy - VEHICLE_RADIUS - 4;
@@ -259,6 +273,8 @@ async function main() {
 
       // ── Debug laser lines ──────────────────────────────────────────────────
       debugLayer.clear();
+
+      // Car-following leader lines (white, thin)
       const leaderIds = new Set();
       for (const v of frame.vehicles) {
         if (v.leader_id == null) continue;
@@ -271,6 +287,26 @@ async function main() {
           .moveTo(fx, fy)
           .lineTo(lx, ly)
           .stroke({ width: 1, color: 0xffffff, alpha: 0.3 });
+      }
+
+      // Oncoming yield lines (orange, thicker) — left-turners watching oncoming
+      for (const v of frame.vehicles) {
+        if (v.oncoming_yield_id == null) continue;
+        const oncoming = byId.get(v.oncoming_yield_id);
+        if (!oncoming) continue;
+        const { sx: fx, sy: fy } = toScreen(v.x, v.y);
+        const { sx: ox, sy: oy } = toScreen(oncoming.x, oncoming.y);
+        debugLayer
+          .moveTo(fx, fy)
+          .lineTo(ox, oy)
+          .stroke({ width: 2, color: COLOR.oncomingLine, alpha: 0.7 });
+        // Small warning diamond at the oncoming vehicle
+        const ds = 6;
+        debugLayer
+          .moveTo(ox, oy - ds).lineTo(ox + ds, oy)
+          .lineTo(ox, oy + ds).lineTo(ox - ds, oy)
+          .lineTo(ox, oy - ds)
+          .stroke({ width: 1.5, color: COLOR.oncomingLine, alpha: 0.9 });
       }
 
       // Show/hide 'L' markers
