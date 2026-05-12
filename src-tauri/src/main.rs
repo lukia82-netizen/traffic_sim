@@ -21,7 +21,7 @@ const FRAME_DURATION: Duration = Duration::from_nanos((1_000_000_000.0 / TARGET_
 #[serde(rename_all = "lowercase")]
 enum VehicleStatus {
     Cruising,
-    Waiting,
+    Yielding, // waiting for right-hand vehicle
     Crossing,
 }
 
@@ -51,8 +51,6 @@ struct Vehicle {
 
 /// Half-width offset of each lane from road centre-line [world units = screen px / VISUAL_SCALE].
 const LANE_OFFSET: f32 = 0.2;
-/// Radius around (0,0) within which yield logic activates [world units = 50 screen px / 100].
-const YIELD_RADIUS: f32 = 0.5;
 
 const ALL_LANES: [LaneId; 4] = [LaneId::North, LaneId::South, LaneId::East, LaneId::West];
 
@@ -71,6 +69,17 @@ fn lane_spawn_pos(lane: LaneId, dist: f32) -> Vec2 {
         LaneId::South => Vec2::new(-LANE_OFFSET, -dist),
         LaneId::East  => Vec2::new( dist, -LANE_OFFSET),
         LaneId::West  => Vec2::new(-dist,  LANE_OFFSET),
+    }
+}
+
+/// Returns the lane that is immediately to the right of the given lane's heading direction.
+/// Used by the Right-Hand Rule yield logic.
+fn right_hand_lane(lane: LaneId) -> LaneId {
+    match lane {
+        LaneId::North => LaneId::West,  // heading S → right is W
+        LaneId::South => LaneId::East,  // heading N → right is E
+        LaneId::East  => LaneId::South, // heading W → right is S
+        LaneId::West  => LaneId::North, // heading E → right is N
     }
 }
 
@@ -94,7 +103,12 @@ struct SimulationSection {
 struct IntersectionSection {
     approach_radius: f32,
     clear_radius: f32,
+    /// Distance from centre within which the right-hand rule activates [world units].
+    #[serde(default = "default_rh_critical_dist")]
+    right_hand_critical_dist: f32,
 }
+
+fn default_rh_critical_dist() -> f32 { 0.6 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IdmSection {
@@ -154,6 +168,7 @@ impl Default for SimulationConfig {
             intersection: IntersectionSection {
                 approach_radius: 0.5,
                 clear_radius: 0.2,
+                right_hand_critical_dist: 0.6,
             },
             idm: IdmSection {
                 a_max: 1.0,
@@ -203,7 +218,8 @@ impl SimulationConfig {
              max_frames = {}    # 0 = run indefinitely\n\n\
              [intersection]\n\
              approach_radius = {}   # distance from conflict point where a vehicle requests access\n\
-             clear_radius    = {}   # distance past conflict point required to release the grant\n\n\
+             clear_radius    = {}   # distance past conflict point required to release the grant\n\
+             right_hand_critical_dist = {}   # right-hand rule activation radius [world units = px/100]\n\n\
              [idm]\n\
              a_max            = {}   # max acceleration [m/s²]\n\
              b_comf           = {}   # comfortable braking [m/s²]\n\
@@ -222,6 +238,7 @@ impl SimulationConfig {
             self.simulation.max_frames,
             self.intersection.approach_radius,
             self.intersection.clear_radius,
+            self.intersection.right_hand_critical_dist,
             self.idm.a_max,
             self.idm.b_comf,
             self.idm.delta,
@@ -337,22 +354,41 @@ impl SimulationState {
                 0.0
             };
 
-            // ── Yield logic ───────────────────────────────────────────────────
-            // Before entering the centre (0,0), yield if any vehicle on a
-            // crossing lane is already within YIELD_RADIUS of centre.
-            let to_conflict   = v.position - v.conflict_point; // conflict_point == (0,0)
-            let past_point    = to_conflict.dot(v.approach_dir) > 0.0;
+            // ── Right-Hand Rule yield logic ───────────────────────────────────
+            // A vehicle (A) must yield to the nearest vehicle (B) on its
+            // right-hand lane when B is within `right_hand_critical_dist` of
+            // the centre, unless A has already entered the intersection or A
+            // wins the ID-based tie-breaker (smaller ID → higher priority).
+            let to_conflict    = v.position - v.conflict_point; // conflict_point == (0,0)
+            let past_point     = to_conflict.dot(v.approach_dir) > 0.0;
             let dist_to_center = v.position.length();
+            let in_intersection = dist_to_center < self.cfg.intersection.clear_radius;
+            let critical_dist  = self.cfg.intersection.right_hand_critical_dist;
 
-            let yield_blocked = !past_point
-                && dist_to_center < YIELD_RADIUS
-                && snapshot.iter().any(|(other_id, other_pos, _, _, other_lane)| {
-                    *other_id != v.id
-                        && lanes_cross(v.lane_id, *other_lane)
-                        && other_pos.length() < YIELD_RADIUS
+            let my_right_lane  = right_hand_lane(v.lane_id);
+            let right_vehicle  = snapshot.iter()
+                .filter(|(id, _, _, _, lane)| *id != v.id && *lane == my_right_lane)
+                .min_by(|(_, pa, ..), (_, pb, ..)| {
+                    pa.length().partial_cmp(&pb.length()).unwrap()
                 });
 
-            let yield_interaction = if yield_blocked {
+            // A yields when: B is within critical distance, A hasn't entered
+            // the intersection yet, and B beats A in the priority check.
+            // Tie-breaker: when both are at similar distances, smaller ID wins.
+            let rh_yield = if let Some((rh_id, rh_pos, ..)) = right_vehicle {
+                let rh_dist = rh_pos.length();
+                if rh_dist < critical_dist && !past_point && !in_intersection {
+                    let similar_dist = (dist_to_center - rh_dist).abs() < 0.15;
+                    let a_wins = similar_dist && v.id < *rh_id;
+                    !a_wins // B has right-of-way unless A wins tie-breaker
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            let yield_interaction = if rh_yield {
                 let s      = (dist_to_center - idm.stop_line_offset).max(f32::EPSILON);
                 let s_star = idm.s0 + speed * idm.t_headway;
                 (s_star / s).powi(2)
@@ -365,8 +401,8 @@ impl SimulationState {
             v.acceleration  = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
 
             // ── Status update ─────────────────────────────────────────────────
-            v.status = if yield_blocked {
-                VehicleStatus::Waiting
+            v.status = if rh_yield {
+                VehicleStatus::Yielding
             } else if past_point && dist_to_center < self.cfg.intersection.clear_radius * 3.0 {
                 VehicleStatus::Crossing
             } else {

@@ -4,15 +4,14 @@ max_frames = 0        # 0 = run indefinitely
 
 [intersection]
 approach_radius = 2.0   # distance from conflict point where a vehicle requests access
-clear_radius    = 0.2   # distance past conflict point required to release the grant
-
+clear_radius    = 0.5   # distance past conflict point required to release the grantright_hand_critical_dist = 0.6   # right-hand rule activation radius [world units = px/100]
 [idm]
 a_max            = 1.0   # max acceleration [m/s2]
 b_comf           = 1.5   # comfortable braking [m/s2]
 delta            = 4.0   # acceleration exponent
 s0               = 0.3   # minimum jam gap at standstill [units]
 t_headway        = 0.8   # safe time headway [s]
-stop_line_offset = 0.5   # distance before conflict point where Waiting vehicle targets to stop
+stop_line_offset = 1.5   # distance before conflict point where Waiting vehicle targets to stop
 vehicle_length   = 0.2   # bumper-to-bumper correction [units]
 
 [spawn]

@@ -8,6 +8,7 @@ const CENTER = CANVAS_SIZE / 2;
 const COLOR = {
   cruising: 0x00cc44,
   crossing: 0x00cc44,
+  yielding: 0xffcc00, // yellow: stopped for right-hand vehicle
   waiting:  0xff2222,
   approach: 0xffee00,
   clear:    0xff8800,
@@ -123,6 +124,7 @@ async function main() {
   const vehicleGraphics = new Map();
   const vehicleLabels   = new Map();
   const leaderMarkers   = new Map(); // "L" text above leaders
+  const yieldMarkers    = new Map(); // "!" text above yielding vehicles
 
   function getOrCreateVehicle(id) {
     if (!vehicleGraphics.has(id)) {
@@ -137,14 +139,25 @@ async function main() {
       label.anchor.set(0.5, 1);
       dynamicLayer.addChild(label);
       vehicleLabels.set(id, label);
+
+      const ym = new PIXI.Text({
+        text: "!",
+        style: { fontSize: 16, fill: COLOR.yielding, fontFamily: "monospace", fontWeight: "bold" },
+      });
+      ym.anchor.set(0.5, 0.5);
+      ym.visible = false;
+      dynamicLayer.addChild(ym);
+      yieldMarkers.set(id, ym);
     }
-    return { g: vehicleGraphics.get(id), label: vehicleLabels.get(id) };
+    return { g: vehicleGraphics.get(id), label: vehicleLabels.get(id), ym: yieldMarkers.get(id) };
   }
 
   function updateVehicle(v) {
-    const { g, label } = getOrCreateVehicle(v.id);
+    const { g, label, ym } = getOrCreateVehicle(v.id);
     const { sx, sy } = toScreen(v.x, v.y);
-    const color = v.status === "waiting" ? COLOR.waiting : COLOR.cruising;
+    const color = v.status === "yielding" ? COLOR.yielding
+                : v.status === "waiting"  ? COLOR.waiting
+                : COLOR.cruising;
 
     g.clear();
     g.circle(sx, sy, VEHICLE_RADIUS).fill({ color, alpha: 0.9 });
@@ -161,6 +174,11 @@ async function main() {
       "V:" + v.speed.toFixed(2) + " A:" + v.accel.toFixed(2);
     label.x = sx;
     label.y = sy - VEHICLE_RADIUS - 4;
+
+    // "!" yield marker
+    ym.visible = v.status === "yielding";
+    ym.x = sx + VEHICLE_RADIUS + 8;
+    ym.y = sy - VEHICLE_RADIUS;
   }
 
   function getOrCreateLeaderMarker(id) {
@@ -255,6 +273,8 @@ async function main() {
           if (label) { dynamicLayer.removeChild(label); vehicleLabels.delete(id); }
           const marker = leaderMarkers.get(id);
           if (marker) { dynamicLayer.removeChild(marker); leaderMarkers.delete(id); }
+          const ym = yieldMarkers.get(id);
+          if (ym) { dynamicLayer.removeChild(ym); yieldMarkers.delete(id); }
         }
       }
 
@@ -270,9 +290,11 @@ async function main() {
       for (const g of vehicleGraphics.values()) dynamicLayer.removeChild(g);
       for (const l of vehicleLabels.values()) dynamicLayer.removeChild(l);
       for (const m of leaderMarkers.values()) dynamicLayer.removeChild(m);
+      for (const y of yieldMarkers.values()) dynamicLayer.removeChild(y);
       vehicleGraphics.clear();
       vehicleLabels.clear();
       leaderMarkers.clear();
+      yieldMarkers.clear();
 
       statsEl.style.color = "#44ff88";
       statsEl.textContent = "Simulation complete — all vehicles crossed.";
