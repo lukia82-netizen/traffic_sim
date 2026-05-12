@@ -175,7 +175,7 @@ impl Default for SimulationConfig {
 }
 
 impl SimulationConfig {
-    const FILE_PATH: &'static str = "src-tauri/sim_config.toml";
+    const FILE_PATH: &'static str = "sim_config.toml";
 
     fn load_or_create() -> Self {
         let path = StdPath::new(Self::FILE_PATH);
