@@ -47,6 +47,7 @@ struct Vehicle {
     acceleration: f32,
     status: VehicleStatus,
     leader_id: Option<usize>,
+    yielding_to_id: Option<usize>, // id of the right-hand vehicle this vehicle is yielding to
 }
 
 /// Half-width offset of each lane from road centre-line [world units = screen px / VISUAL_SCALE].
@@ -106,9 +107,17 @@ struct IntersectionSection {
     /// Distance from centre within which the right-hand rule activates [world units].
     #[serde(default = "default_rh_critical_dist")]
     right_hand_critical_dist: f32,
+    /// Max distance difference between A and B for tie-breaker to apply [world units].
+    #[serde(default = "default_rh_tiebreaker_dist")]
+    rh_tiebreaker_dist: f32,
+    /// If vehicle is within this distance from centre it never yields (escape hatch) [world units].
+    #[serde(default = "default_rh_escape_dist")]
+    rh_escape_dist: f32,
 }
 
 fn default_rh_critical_dist() -> f32 { 0.6 }
+fn default_rh_tiebreaker_dist() -> f32 { 0.15 }
+fn default_rh_escape_dist() -> f32 { 0.2 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IdmSection {
@@ -169,6 +178,8 @@ impl Default for SimulationConfig {
                 approach_radius: 0.5,
                 clear_radius: 0.2,
                 right_hand_critical_dist: 0.6,
+                rh_tiebreaker_dist: 0.15,
+                rh_escape_dist: 0.2,
             },
             idm: IdmSection {
                 a_max: 1.0,
@@ -219,7 +230,9 @@ impl SimulationConfig {
              [intersection]\n\
              approach_radius = {}   # distance from conflict point where a vehicle requests access\n\
              clear_radius    = {}   # distance past conflict point required to release the grant\n\
-             right_hand_critical_dist = {}   # right-hand rule activation radius [world units = px/100]\n\n\
+             right_hand_critical_dist = {}   # right-hand rule activation radius [world units = px/100]\n\
+             rh_tiebreaker_dist       = {}   # max distance difference for tie-breaker to apply [world units]\n\
+             rh_escape_dist           = {}   # if vehicle is closer than this to centre, it never stops [world units]\n\n\
              [idm]\n\
              a_max            = {}   # max acceleration [m/s²]\n\
              b_comf           = {}   # comfortable braking [m/s²]\n\
@@ -239,6 +252,8 @@ impl SimulationConfig {
             self.intersection.approach_radius,
             self.intersection.clear_radius,
             self.intersection.right_hand_critical_dist,
+            self.intersection.rh_tiebreaker_dist,
+            self.intersection.rh_escape_dist,
             self.idm.a_max,
             self.idm.b_comf,
             self.idm.delta,
@@ -292,6 +307,7 @@ impl SimulationState {
                     acceleration: 0.0,
                     status: VehicleStatus::Cruising,
                     leader_id: None,
+                    yielding_to_id: None,
                 }
             })
             .collect();
@@ -362,8 +378,9 @@ impl SimulationState {
             let to_conflict    = v.position - v.conflict_point; // conflict_point == (0,0)
             let past_point     = to_conflict.dot(v.approach_dir) > 0.0;
             let dist_to_center = v.position.length();
-            let in_intersection = dist_to_center < self.cfg.intersection.clear_radius;
+            let in_intersection = dist_to_center < self.cfg.intersection.rh_escape_dist;
             let critical_dist  = self.cfg.intersection.right_hand_critical_dist;
+            let tiebreaker_dist = self.cfg.intersection.rh_tiebreaker_dist;
 
             let my_right_lane  = right_hand_lane(v.lane_id);
             let right_vehicle  = snapshot.iter()
@@ -375,17 +392,17 @@ impl SimulationState {
             // A yields when: B is within critical distance, A hasn't entered
             // the intersection yet, and B beats A in the priority check.
             // Tie-breaker: when both are at similar distances, smaller ID wins.
-            let rh_yield = if let Some((rh_id, rh_pos, ..)) = right_vehicle {
+            let (rh_yield, rh_yield_target) = if let Some((rh_id, rh_pos, ..)) = right_vehicle {
                 let rh_dist = rh_pos.length();
                 if rh_dist < critical_dist && !past_point && !in_intersection {
-                    let similar_dist = (dist_to_center - rh_dist).abs() < 0.15;
+                    let similar_dist = (dist_to_center - rh_dist).abs() < tiebreaker_dist;
                     let a_wins = similar_dist && v.id < *rh_id;
-                    !a_wins // B has right-of-way unless A wins tie-breaker
+                    (!a_wins, if !a_wins { Some(*rh_id) } else { None })
                 } else {
-                    false
+                    (false, None)
                 }
             } else {
-                false
+                (false, None)
             };
 
             let yield_interaction = if rh_yield {
@@ -401,6 +418,7 @@ impl SimulationState {
             v.acceleration  = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
 
             // ── Status update ─────────────────────────────────────────────────
+            v.yielding_to_id = rh_yield_target;
             v.status = if rh_yield {
                 VehicleStatus::Yielding
             } else if past_point && dist_to_center < self.cfg.intersection.clear_radius * 3.0 {
@@ -446,6 +464,7 @@ impl SimulationState {
                     speed: v.current_speed,
                     accel: v.acceleration,
                     leader_id: v.leader_id,
+                    yielding_to_id: v.yielding_to_id,
                 })
                 .collect(),
             approach_radius: self.cfg.intersection.approach_radius,
@@ -467,6 +486,7 @@ struct VehicleFrame {
     speed: f32,
     accel: f32,
     leader_id: Option<usize>,
+    yielding_to_id: Option<usize>,
 }
 
 #[derive(Serialize, Clone)]

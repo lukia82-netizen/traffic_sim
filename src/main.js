@@ -233,21 +233,36 @@ async function main() {
       // Build a quick id→vehicle lookup for the debug pass.
       const byId = new Map(frame.vehicles.map((v) => [v.id, v]));
 
-      // ── Debug: laser lines between followers and their leaders ────────────
+      // ── Debug: lines between followers→leaders and yielders→right-hand ─────
       debugLayer.clear();
       // Collect which vehicles ARE leaders so we can draw the 'L' badge.
       const leaderIds = new Set();
       for (const v of frame.vehicles) {
-        if (v.leader_id == null) continue;
-        const leader = byId.get(v.leader_id);
-        if (!leader) continue;
-        leaderIds.add(v.leader_id);
-        const { sx: fx, sy: fy } = toScreen(v.x, v.y);
-        const { sx: lx, sy: ly } = toScreen(leader.x, leader.y);
-        debugLayer
-          .moveTo(fx, fy)
-          .lineTo(lx, ly)
-          .stroke({ width: 1, color: 0xffffff, alpha: 0.3 });
+        // Leader-following line (cyan)
+        if (v.leader_id != null) {
+          const leader = byId.get(v.leader_id);
+          if (leader) {
+            leaderIds.add(v.leader_id);
+            const { sx: fx, sy: fy } = toScreen(v.x, v.y);
+            const { sx: lx, sy: ly } = toScreen(leader.x, leader.y);
+            debugLayer
+              .moveTo(fx, fy)
+              .lineTo(lx, ly)
+              .stroke({ width: 2, color: 0x00ccff, alpha: 0.7 });
+          }
+        }
+        // Yield line (yellow dashed look — drawn as a thicker yellow line)
+        if (v.yielding_to_id != null) {
+          const target = byId.get(v.yielding_to_id);
+          if (target) {
+            const { sx: fx, sy: fy } = toScreen(v.x, v.y);
+            const { sx: tx, sy: ty } = toScreen(target.x, target.y);
+            debugLayer
+              .moveTo(fx, fy)
+              .lineTo(tx, ty)
+              .stroke({ width: 2.5, color: 0xffcc00, alpha: 0.85 });
+          }
+        }
       }
 
       // Show / hide 'L' markers.
