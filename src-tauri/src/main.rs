@@ -12,10 +12,11 @@ use tauri::{AppHandle, Emitter};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const TARGET_FPS:       f64      = 60.0;
-const FRAME_DURATION:   Duration = Duration::from_nanos((1_000_000_000.0 / TARGET_FPS) as u64);
-const LANE_OFFSET:      f32      = 0.2;  // half-width of lane from road centre-line [world units]
-const TURN_THRESHOLD:   f32      = 0.15; // distance from centre that triggers left-turn transform
+const TARGET_FPS:     f64      = 60.0;
+const FRAME_DURATION: Duration = Duration::from_nanos((1_000_000_000.0 / TARGET_FPS) as u64);
+const LANE_OFFSET:    f32      = 0.2;  // half-width of lane from road centre-line [world units]
+// Bezier end-point: how far past centre on the new lane the curve terminates.
+const BEZIER_EXIT_DIST: f32    = 1.5;
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
@@ -105,6 +106,42 @@ fn lane_for_direction(dir: Vec2) -> LaneId {
     else                 { LaneId::North }
 }
 
+// ─── Quadratic Bezier helpers ─────────────────────────────────────────────────
+
+/// Position on quadratic Bezier at parameter t ∈ [0, 1].
+fn bezier_pos(s: Vec2, c: Vec2, e: Vec2, t: f32) -> Vec2 {
+    let u = 1.0 - t;
+    u * u * s + 2.0 * u * t * c + t * t * e
+}
+
+/// Unit tangent direction of the quadratic Bezier at parameter t.
+fn bezier_tangent(s: Vec2, c: Vec2, e: Vec2, t: f32) -> Vec2 {
+    let u = 1.0 - t;
+    let d = 2.0 * u * (c - s) + 2.0 * t * (e - c);
+    if d.length_squared() > 1e-12 { d.normalize() } else { (e - s).normalize() }
+}
+
+/// Arc length via 16-step Gaussian-style numerical integration.
+fn bezier_length(s: Vec2, c: Vec2, e: Vec2) -> f32 {
+    const N: usize = 16;
+    let (mut len, mut prev) = (0.0_f32, s);
+    for i in 1..=N {
+        let p = bezier_pos(s, c, e, i as f32 / N as f32);
+        len  += (p - prev).length();
+        prev  = p;
+    }
+    len
+}
+
+/// Compute the Bezier control point such that the tangent at t=0 equals `old_dir`
+/// and the tangent at t=1 equals the new (CCW-rotated) direction.
+/// For a 90° left turn at a standard 4-way intersection this always lands at
+/// the "elbow" corner: (±LANE_OFFSET, ±LANE_OFFSET).
+fn left_turn_ctrl(start: Vec2, end: Vec2, old_dir: Vec2) -> Vec2 {
+    let c1 = (end - start).dot(old_dir);
+    start + c1 * old_dir
+}
+
 // ─── Simulation data ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -120,7 +157,14 @@ struct Vehicle {
     status:            VehicleStatus,
     intent:            VehicleIntent,
     leader_id:         Option<usize>,
-    oncoming_yield_id: Option<usize>, // set when left-turner is waiting for an oncoming gap
+    oncoming_yield_id: Option<usize>,
+    // ── Bezier turn state ─────────────────────────────────────────────────────
+    /// Normalised curve progress [0 – 1+]; None = not currently turning.
+    turning_progress:  Option<f32>,
+    turn_start:        Vec2, // world position when the turn was triggered
+    turn_ctrl:         Vec2, // quadratic Bezier control point
+    turn_end:          Vec2, // world position at curve end (on new lane)
+    turn_curve_length: f32,  // pre-computed arc length for speed → Δp conversion
 }
 
 // ─── Traffic Light Manager ────────────────────────────────────────────────────
@@ -169,7 +213,6 @@ struct SimulationSection {
 struct IntersectionSection {
     approach_radius: f32,
     clear_radius:    f32,
-    /// Oncoming vehicle within this distance from centre blocks a left-turn.
     #[serde(default = "default_oncoming_clear_dist")]
     oncoming_clear_dist: f32,
 }
@@ -212,7 +255,6 @@ struct SpawnSection {
     offmap_distance: f32,
     #[serde(default = "default_num_vehicles")]
     num_vehicles: usize,
-    /// Fraction of spawned vehicles assigned a left-turn intent [0.0 – 1.0].
     #[serde(default = "default_left_turn_probability")]
     left_turn_probability: f32,
 }
@@ -370,6 +412,11 @@ impl SimulationState {
                     intent,
                     leader_id:         None,
                     oncoming_yield_id: None,
+                    turning_progress:  None,
+                    turn_start:        Vec2::ZERO,
+                    turn_ctrl:         Vec2::ZERO,
+                    turn_end:          Vec2::ZERO,
+                    turn_curve_length: 1.0,
                 }
             })
             .collect();
@@ -391,13 +438,12 @@ impl SimulationState {
 
     fn is_finished(&self) -> bool { self.vehicles.is_empty() }
 
-    // ── IDM acceleration (traffic lights + car-following + left-turn oncoming) ─
+    // ── IDM acceleration ──────────────────────────────────────────────────────
 
     fn idm_step(&mut self) {
-        let idm  = self.cfg.idm.clone();
-        let ocd  = self.cfg.intersection.oncoming_clear_dist;
+        let idm = self.cfg.idm.clone();
+        let ocd = self.cfg.intersection.oncoming_clear_dist;
 
-        // Snapshot: (id, position, approach_dir, speed, lane_id).
         let snap: Vec<(usize, Vec2, Vec2, f32, LaneId)> = self
             .vehicles
             .iter()
@@ -407,6 +453,40 @@ impl SimulationState {
         for v in &mut self.vehicles {
             let speed = v.current_speed;
             let v0    = v.max_speed;
+
+            // ── Bezier-turning vehicles: simplified physics ───────────────────
+            // Only free-road acceleration + oncoming yield for first half of turn.
+            if let Some(p) = v.turning_progress {
+                let free_road = 1.0 - (speed / v0).powf(idm.delta);
+
+                let (oi, ocy_id) = if p < 0.5 {
+                    let opp = oncoming_lane(v.lane_id);
+                    let closest = snap
+                        .iter()
+                        .filter(|(id, pos, _, _, lane)| {
+                            *id != v.id && *lane == opp && pos.length() < ocd
+                        })
+                        .min_by(|(_, a, ..), (_, b, ..)| {
+                            a.length().partial_cmp(&b.length()).unwrap()
+                        });
+
+                    if let Some((oc_id, _, ..)) = closest {
+                        let s      = v.position.length().max(f32::EPSILON);
+                        let s_star = idm.s0 + speed * idm.t_headway;
+                        ((s_star / s).powi(2), Some(*oc_id))
+                    } else {
+                        (0.0, None)
+                    }
+                } else {
+                    (0.0, None)
+                };
+
+                v.oncoming_yield_id = ocy_id;
+                v.leader_id         = None;
+                v.acceleration      = (idm.a_max * (free_road - oi)).max(-idm.b_comf);
+                v.status            = VehicleStatus::Crossing;
+                continue;
+            }
 
             // ── Free-road term ────────────────────────────────────────────────
             let free_road = 1.0 - (speed / v0).powf(idm.delta);
@@ -442,7 +522,6 @@ impl SimulationState {
             let dist_to_stop   = to_conflict.length() - idm.stop_line_offset;
             let past_stop_line = dist_to_stop <= 0.0;
 
-            // Only brake at stop line if approaching on red and not yet past the line.
             let tl_interaction = if !lane_green && !past_point && !past_stop_line {
                 let s      = dist_to_stop.max(f32::EPSILON);
                 let s_star = idm.s0 + speed * idm.t_headway;
@@ -452,9 +531,6 @@ impl SimulationState {
             };
 
             // ── Left-turn oncoming yield ──────────────────────────────────────
-            // A left-turner on GREEN yields to any oncoming vehicle within
-            // `oncoming_clear_dist` of centre by braking toward the centre.
-            // Once past centre the turn is already committed → no more check.
             let is_left = v.intent == VehicleIntent::Left;
             let (oncoming_interaction, ocy_id) = if is_left && lane_green && !past_point {
                 let opp     = oncoming_lane(v.lane_id);
@@ -480,7 +556,6 @@ impl SimulationState {
 
             v.oncoming_yield_id = ocy_id;
 
-            // Worst-case interaction wins.
             let interaction = car_following.max(tl_interaction).max(oncoming_interaction);
             v.acceleration  = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
 
@@ -500,37 +575,89 @@ impl SimulationState {
         }
     }
 
-    // ── Euler integration ─────────────────────────────────────────────────────
+    // ── Euler integration + Bezier curve movement ─────────────────────────────
 
     fn movement_step(&mut self, dt: f32) {
         for v in &mut self.vehicles {
             v.current_speed = (v.current_speed + v.acceleration * dt).clamp(0.0, v.max_speed);
-            v.position += v.approach_dir * v.current_speed * dt;
+
+            match v.turning_progress {
+                Some(p) => {
+                    // Advance parameter proportional to arc-speed.
+                    let new_p = p + v.current_speed * dt / v.turn_curve_length;
+                    let t     = new_p.min(1.0);
+                    v.position         = bezier_pos(v.turn_start, v.turn_ctrl, v.turn_end, t);
+                    v.approach_dir     = bezier_tangent(v.turn_start, v.turn_ctrl, v.turn_end, t);
+                    v.turning_progress = Some(new_p);
+                }
+                None => {
+                    v.position += v.approach_dir * v.current_speed * dt;
+                }
+            }
         }
     }
 
-    // ── Left-turn path transformation ─────────────────────────────────────────
-    // Once a left-turning vehicle reaches the centre (within TURN_THRESHOLD),
-    // rotate its direction 90° CCW, snap to the new lane axis, update lane_id.
+    // ── Bezier turn trigger + completion ──────────────────────────────────────
+    // Replaces the old instant-snap left_turn_step.
 
     fn left_turn_step(&mut self) {
+        let stop_line = self.cfg.idm.stop_line_offset;
+        let ocd       = self.cfg.intersection.oncoming_clear_dist;
+
+        // Snapshot of positions + lanes for oncoming check (avoid borrow conflict).
+        let snap: Vec<(usize, Vec2, LaneId)> = self
+            .vehicles
+            .iter()
+            .map(|v| (v.id, v.position, v.lane_id))
+            .collect();
+
         for v in &mut self.vehicles {
             if v.intent != VehicleIntent::Left { continue; }
-            if v.position.length() > TURN_THRESHOLD { continue; }
 
+            // ── Complete a finished curve ─────────────────────────────────────
+            match v.turning_progress {
+                Some(p) if p >= 1.0 => {
+                    v.approach_dir      = bezier_tangent(v.turn_start, v.turn_ctrl, v.turn_end, 1.0);
+                    v.position          = v.turn_end;
+                    v.lane_id           = lane_for_direction(v.approach_dir);
+                    v.intent            = VehicleIntent::Straight;
+                    v.turning_progress  = None;
+                    v.leader_id         = None;
+                    v.oncoming_yield_id = None;
+                    continue;
+                }
+                Some(_) => continue, // mid-turn, position managed in movement_step
+                None    => {}        // fall through to trigger check
+            }
+
+            // ── Trigger: at stop line, green, oncoming clear ──────────────────
+            let dist_from_centre = v.position.length();
+            // Accept positions that have reached or just passed the stop line.
+            if dist_from_centre > stop_line + 0.05 { continue; }
+            // Don't re-trigger once the vehicle is well past centre.
+            if v.position.dot(v.approach_dir) > 0.1 { continue; }
+
+            if !self.lights.is_green(v.lane_id) { continue; }
+
+            let opp = oncoming_lane(v.lane_id);
+            let oncoming_blocks = snap.iter().any(|(id, pos, lane)| {
+                *id != v.id && *lane == opp && pos.length() < ocd
+            });
+            if oncoming_blocks { continue; }
+
+            // ── Build Bezier geometry ─────────────────────────────────────────
+            // CCW 90° rotation gives the exit direction for a left turn.
             let old_dir = v.approach_dir;
-            // CCW 90°: (x,y) → (-y, x)
             let new_dir = Vec2::new(-old_dir.y, old_dir.x);
-            // Progress the vehicle has made along the NEW direction.
-            let along_new = v.position.dot(new_dir) * new_dir;
-            // Lane centre offset for the new road = -old_dir * LANE_OFFSET
-            // (verified for all four turning cases in the design notes).
-            v.position    = along_new + (-old_dir) * LANE_OFFSET;
-            v.approach_dir = new_dir;
-            v.lane_id      = lane_for_direction(new_dir);
-            v.intent       = VehicleIntent::Straight;
-            v.leader_id    = None;
-            v.oncoming_yield_id = None;
+            let end     = new_dir * BEZIER_EXIT_DIST + (-old_dir) * LANE_OFFSET;
+            let ctrl    = left_turn_ctrl(v.position, end, old_dir);
+            let clen    = bezier_length(v.position, ctrl, end).max(0.1);
+
+            v.turn_start       = v.position;
+            v.turn_ctrl        = ctrl;
+            v.turn_end         = end;
+            v.turn_curve_length = clen;
+            v.turning_progress  = Some(0.0);
         }
     }
 
@@ -539,6 +666,8 @@ impl SimulationState {
     fn remove_finished(&mut self) {
         let offmap = self.cfg.spawn.offmap_distance;
         self.vehicles.retain(|v| {
+            // Don't remove mid-turn vehicles; their lane_id hasn't switched yet.
+            if v.turning_progress.is_some() { return true; }
             let to_conflict = v.position - v.conflict_point;
             let past_point  = to_conflict.dot(v.approach_dir) > 0.0;
             !(past_point && to_conflict.length() > offmap)
@@ -562,6 +691,13 @@ impl SimulationState {
                     accel:             v.acceleration,
                     leader_id:         v.leader_id,
                     oncoming_yield_id: v.oncoming_yield_id,
+                    turning_progress:  v.turning_progress,
+                    turn_start_x:      v.turn_start.x,
+                    turn_start_y:      v.turn_start.y,
+                    turn_ctrl_x:       v.turn_ctrl.x,
+                    turn_ctrl_y:       v.turn_ctrl.y,
+                    turn_end_x:        v.turn_end.x,
+                    turn_end_y:        v.turn_end.y,
                 })
                 .collect(),
             approach_radius:  self.cfg.intersection.approach_radius,
@@ -588,6 +724,14 @@ struct VehicleFrame {
     accel:             f32,
     leader_id:         Option<usize>,
     oncoming_yield_id: Option<usize>,
+    // Bezier turn data (only meaningful when turning_progress is Some)
+    turning_progress:  Option<f32>,
+    turn_start_x:      f32,
+    turn_start_y:      f32,
+    turn_ctrl_x:       f32,
+    turn_ctrl_y:       f32,
+    turn_end_x:        f32,
+    turn_end_y:        f32,
 }
 
 #[derive(Serialize, Clone)]
