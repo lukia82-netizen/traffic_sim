@@ -37,11 +37,12 @@ enum VehicleIntent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(usize)]
 enum LaneId {
-    North,
-    South,
-    East,
-    West,
+    North = 0,
+    South = 1,
+    East = 2,
+    West = 3,
 }
 
 /// Traffic-light phase — cycles NS-green → all-red → EW-green → all-red → …
@@ -430,9 +431,27 @@ impl SimulationState {
 
     fn tick(&mut self, dt: f32) {
         self.lights.tick(dt);
-        self.idm_step();
+
+        // Group vehicles by lane and sort by projection along approach direction (leader has smallest projection).
+        // This allows O(1) leader lookup for each vehicle.
+        let mut lane_groups: [Vec<usize>; 4] = [vec![], vec![], vec![], vec![]];
+        for (i, v) in self.vehicles.iter().enumerate() {
+            lane_groups[v.lane_id as usize].push(i);
+        }
+
+        for (lane_idx, group) in lane_groups.iter_mut().enumerate() {
+            let lane = ALL_LANES[lane_idx];
+            let dir = lane_direction(lane);
+            group.sort_by(|&a, &b| {
+                let pos_a = self.vehicles[a].position;
+                let pos_b = self.vehicles[b].position;
+                pos_a.dot(dir).partial_cmp(&pos_b.dot(dir)).unwrap()
+            });
+        }
+
+        self.idm_step(&lane_groups);
         self.movement_step(dt);
-        self.left_turn_step();
+        self.left_turn_step(&lane_groups);
         self.remove_finished();
     }
 
@@ -440,40 +459,47 @@ impl SimulationState {
 
     // ── IDM acceleration ──────────────────────────────────────────────────────
 
-    fn idm_step(&mut self) {
-        let idm = self.cfg.idm.clone();
+    fn idm_step(&mut self, lane_groups: &[Vec<usize>; 4]) {
+        let idm = &self.cfg.idm;
         let ocd = self.cfg.intersection.oncoming_clear_dist;
 
-        let snap: Vec<(usize, Vec2, Vec2, f32, LaneId)> = self
-            .vehicles
-            .iter()
-            .map(|v| (v.id, v.position, v.approach_dir, v.current_speed, v.lane_id))
-            .collect();
+        // Take a snapshot for atomic updates.
+        let snap: Vec<Vehicle> = self.vehicles.clone();
 
-        for v in &mut self.vehicles {
+        // Map original vehicle index to its leader's index in the snapshot.
+        // With vehicles sorted by projection along approach direction, the vehicle with the LARGER projection is ahead.
+        // So for sorted group[i], the leader is group[i+1].
+        let mut leaders = vec![None; self.vehicles.len()];
+        for group in lane_groups {
+            for i in 0..group.len().saturating_sub(1) {
+                leaders[group[i]] = Some(group[i + 1]);
+            }
+        }
+
+        for i in 0..self.vehicles.len() {
+            let v = &snap[i];
             let speed = v.current_speed;
-            let v0    = v.max_speed;
+            let v0 = v.max_speed;
 
             // ── Bezier-turning vehicles: simplified physics ───────────────────
-            // Only free-road acceleration + oncoming yield for first half of turn.
             if let Some(p) = v.turning_progress {
                 let free_road = 1.0 - (speed / v0).powf(idm.delta);
 
                 let (oi, ocy_id) = if p < 0.5 {
                     let opp = oncoming_lane(v.lane_id);
-                    let closest = snap
-                        .iter()
-                        .filter(|(id, pos, _, _, lane)| {
-                            *id != v.id && *lane == opp && pos.length() < ocd
-                        })
-                        .min_by(|(_, a, ..), (_, b, ..)| {
-                            a.length().partial_cmp(&b.length()).unwrap()
+                    let opp_group = &lane_groups[opp as usize];
+
+                    let closest = opp_group.iter()
+                        .filter(|&&idx| snap[idx].position.length() < ocd)
+                        .min_by(|&&a, &&b| {
+                            snap[a].position.length().partial_cmp(&snap[b].position.length()).unwrap()
                         });
 
-                    if let Some((oc_id, _, ..)) = closest {
-                        let s      = v.position.length().max(f32::EPSILON);
+                    if let Some(&oc_idx) = closest {
+                        let oc = &snap[oc_idx];
+                        let s = v.position.length().max(f32::EPSILON);
                         let s_star = idm.s0 + speed * idm.t_headway;
-                        ((s_star / s).powi(2), Some(*oc_id))
+                        ((s_star / s).powi(2), Some(oc.id))
                     } else {
                         (0.0, None)
                     }
@@ -481,10 +507,11 @@ impl SimulationState {
                     (0.0, None)
                 };
 
-                v.oncoming_yield_id = ocy_id;
-                v.leader_id         = None;
-                v.acceleration      = (idm.a_max * (free_road - oi)).max(-idm.b_comf);
-                v.status            = VehicleStatus::Crossing;
+                let target_v = &mut self.vehicles[i];
+                target_v.oncoming_yield_id = ocy_id;
+                target_v.leader_id = None;
+                target_v.acceleration = (idm.a_max * (free_road - oi)).max(-idm.b_comf);
+                target_v.status = VehicleStatus::Crossing;
                 continue;
             }
 
@@ -492,20 +519,14 @@ impl SimulationState {
             let free_road = 1.0 - (speed / v0).powf(idm.delta);
 
             // ── Car-following: same lane only ─────────────────────────────────
-            let leader = snap
-                .iter()
-                .filter(|(id, _, _, _, lane)| *id != v.id && *lane == v.lane_id)
-                .filter_map(|(lid, pos, _, ls, _)| {
-                    let proj = (*pos - v.position).dot(v.approach_dir);
-                    if proj > 0.0 { Some((*lid, proj, *ls)) } else { None }
-                })
-                .min_by(|(_, a, _), (_, b, _)| a.partial_cmp(b).unwrap());
+            let leader_idx = leaders[i];
+            let v_leader_id = leader_idx.map(|idx| snap[idx].id);
 
-            v.leader_id = leader.map(|(lid, _, _)| lid);
-
-            let car_following = if let Some((_, gap, ls)) = leader {
-                let s      = (gap - idm.vehicle_length).max(f32::EPSILON);
-                let dv     = speed - ls;
+            let car_following = if let Some(l_idx) = leader_idx {
+                let leader = &snap[l_idx];
+                let gap = (leader.position - v.position).dot(v.approach_dir);
+                let s = (gap - idm.vehicle_length).max(f32::EPSILON);
+                let dv = speed - leader.current_speed;
                 let s_star = idm.s0
                     + (speed * idm.t_headway
                         + speed * dv / (2.0 * (idm.a_max * idm.b_comf).sqrt()))
@@ -516,14 +537,14 @@ impl SimulationState {
             };
 
             // ── Traffic-light stop-line term ──────────────────────────────────
-            let to_conflict    = v.position - v.conflict_point;
-            let past_point     = to_conflict.dot(v.approach_dir) > 0.0;
-            let lane_green     = self.lights.is_green(v.lane_id);
-            let dist_to_stop   = to_conflict.length() - idm.stop_line_offset;
+            let to_conflict = v.position - v.conflict_point;
+            let past_point = to_conflict.dot(v.approach_dir) > 0.0;
+            let lane_green = self.lights.is_green(v.lane_id);
+            let dist_to_stop = to_conflict.length() - idm.stop_line_offset;
             let past_stop_line = dist_to_stop <= 0.0;
 
             let tl_interaction = if !lane_green && !past_point && !past_stop_line {
-                let s      = dist_to_stop.max(f32::EPSILON);
+                let s = dist_to_stop.max(f32::EPSILON);
                 let s_star = idm.s0 + speed * idm.t_headway;
                 (s_star / s).powi(2)
             } else {
@@ -533,20 +554,19 @@ impl SimulationState {
             // ── Left-turn oncoming yield ──────────────────────────────────────
             let is_left = v.intent == VehicleIntent::Left;
             let (oncoming_interaction, ocy_id) = if is_left && lane_green && !past_point {
-                let opp     = oncoming_lane(v.lane_id);
-                let closest = snap
-                    .iter()
-                    .filter(|(id, pos, _, _, lane)| {
-                        *id != v.id && *lane == opp && pos.length() < ocd
-                    })
-                    .min_by(|(_, a, ..), (_, b, ..)| {
-                        a.length().partial_cmp(&b.length()).unwrap()
+                let opp = oncoming_lane(v.lane_id);
+                let opp_group = &lane_groups[opp as usize];
+                let closest = opp_group.iter()
+                    .filter(|&&idx| snap[idx].position.length() < ocd)
+                    .min_by(|&&a, &&b| {
+                        snap[a].position.length().partial_cmp(&snap[b].position.length()).unwrap()
                     });
 
-                if let Some((oc_id, _, ..)) = closest {
-                    let s      = v.position.length().max(f32::EPSILON);
+                if let Some(&oc_idx) = closest {
+                    let oc = &snap[oc_idx];
+                    let s = v.position.length().max(f32::EPSILON);
                     let s_star = idm.s0 + speed * idm.t_headway;
-                    ((s_star / s).powi(2), Some(*oc_id))
+                    ((s_star / s).powi(2), Some(oc.id))
                 } else {
                     (0.0, None)
                 }
@@ -554,14 +574,17 @@ impl SimulationState {
                 (0.0, None)
             };
 
-            v.oncoming_yield_id = ocy_id;
-
             let interaction = car_following.max(tl_interaction).max(oncoming_interaction);
-            v.acceleration  = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
+
+            // Apply changes to the real vehicle.
+            let target_v = &mut self.vehicles[i];
+            target_v.leader_id = v_leader_id;
+            target_v.oncoming_yield_id = ocy_id;
+            target_v.acceleration = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
 
             // ── Status ────────────────────────────────────────────────────────
             let dist_to_center = v.position.length();
-            v.status = if !lane_green && !past_point && !past_stop_line {
+            target_v.status = if !lane_green && !past_point && !past_stop_line {
                 VehicleStatus::Stopped
             } else if ocy_id.is_some() {
                 VehicleStatus::Yielding
@@ -600,59 +623,65 @@ impl SimulationState {
     // ── Bezier turn trigger + completion ──────────────────────────────────────
     // Replaces the old instant-snap left_turn_step.
 
-    fn left_turn_step(&mut self) {
+    fn left_turn_step(&mut self, lane_groups: &[Vec<usize>; 4]) {
         let stop_line = self.cfg.idm.stop_line_offset;
         let ocd       = self.cfg.intersection.oncoming_clear_dist;
 
-        // Snapshot of positions + lanes for oncoming check (avoid borrow conflict).
-        let snap: Vec<(usize, Vec2, LaneId)> = self
-            .vehicles
-            .iter()
-            .map(|v| (v.id, v.position, v.lane_id))
-            .collect();
+        // Take a snapshot for oncoming traffic check.
+        let snap: Vec<Vehicle> = self.vehicles.clone();
 
-        for v in &mut self.vehicles {
-            if v.intent != VehicleIntent::Left { continue; }
+        for i in 0..self.vehicles.len() {
+            if self.vehicles[i].intent != VehicleIntent::Left { continue; }
 
             // ── Complete a finished curve ─────────────────────────────────────
-            match v.turning_progress {
-                Some(p) if p >= 1.0 => {
-                    v.approach_dir      = bezier_tangent(v.turn_start, v.turn_ctrl, v.turn_end, 1.0);
-                    v.position          = v.turn_end;
-                    v.lane_id           = lane_for_direction(v.approach_dir);
-                    v.intent            = VehicleIntent::Straight;
-                    v.turning_progress  = None;
-                    v.leader_id         = None;
-                    v.oncoming_yield_id = None;
-                    continue;
+            let mut trigger_check = false;
+            {
+                let v = &mut self.vehicles[i];
+                match v.turning_progress {
+                    Some(p) if p >= 1.0 => {
+                        v.approach_dir      = bezier_tangent(v.turn_start, v.turn_ctrl, v.turn_end, 1.0);
+                        v.position          = v.turn_end;
+                        v.lane_id           = lane_for_direction(v.approach_dir);
+                        v.intent            = VehicleIntent::Straight;
+                        v.turning_progress  = None;
+                        v.leader_id         = None;
+                        v.oncoming_yield_id = None;
+                        continue;
+                    }
+                    Some(_) => continue, // mid-turn, position managed in movement_step
+                    None    => { trigger_check = true; }
                 }
-                Some(_) => continue, // mid-turn, position managed in movement_step
-                None    => {}        // fall through to trigger check
             }
 
+            if !trigger_check { continue; }
+
             // ── Trigger: at stop line, green, oncoming clear ──────────────────
-            let dist_from_centre = v.position.length();
-            // Accept positions that have reached or just passed the stop line.
+            let (v_id, v_lane_id, v_pos, v_approach_dir) = {
+                let v = &snap[i];
+                (v.id, v.lane_id, v.position, v.approach_dir)
+            };
+
+            let dist_from_centre = v_pos.length();
             if dist_from_centre > stop_line + 0.05 { continue; }
-            // Don't re-trigger once the vehicle is well past centre.
-            if v.position.dot(v.approach_dir) > 0.1 { continue; }
+            if v_pos.dot(v_approach_dir) > 0.1 { continue; }
+            if !self.lights.is_green(v_lane_id) { continue; }
 
-            if !self.lights.is_green(v.lane_id) { continue; }
-
-            let opp = oncoming_lane(v.lane_id);
-            let oncoming_blocks = snap.iter().any(|(id, pos, lane)| {
-                *id != v.id && *lane == opp && pos.length() < ocd
+            let opp = oncoming_lane(v_lane_id);
+            let opp_group = &lane_groups[opp as usize];
+            let oncoming_blocks = opp_group.iter().any(|&idx| {
+                let oc = &snap[idx];
+                oc.id != v_id && oc.position.length() < ocd
             });
             if oncoming_blocks { continue; }
 
             // ── Build Bezier geometry ─────────────────────────────────────────
             // CCW 90° rotation gives the exit direction for a left turn.
-            let old_dir = v.approach_dir;
-            let new_dir = Vec2::new(-old_dir.y, old_dir.x);
-            let end     = new_dir * BEZIER_EXIT_DIST + (-old_dir) * LANE_OFFSET;
-            let ctrl    = left_turn_ctrl(v.position, end, old_dir);
-            let clen    = bezier_length(v.position, ctrl, end).max(0.1);
+            let new_dir = Vec2::new(-v_approach_dir.y, v_approach_dir.x);
+            let end     = new_dir * BEZIER_EXIT_DIST + (-v_approach_dir) * LANE_OFFSET;
+            let ctrl    = left_turn_ctrl(v_pos, end, v_approach_dir);
+            let clen    = bezier_length(v_pos, ctrl, end).max(0.1);
 
+            let v = &mut self.vehicles[i];
             v.turn_start       = v.position;
             v.turn_ctrl        = ctrl;
             v.turn_end         = end;
