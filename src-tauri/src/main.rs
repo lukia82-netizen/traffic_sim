@@ -37,11 +37,12 @@ enum VehicleIntent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(usize)]
 enum LaneId {
-    North,
-    South,
-    East,
-    West,
+    North = 0,
+    South = 1,
+    East = 2,
+    West = 3,
 }
 
 /// Traffic-light phase — cycles NS-green → all-red → EW-green → all-red → …
@@ -441,39 +442,119 @@ impl SimulationState {
     // ── IDM acceleration ──────────────────────────────────────────────────────
 
     fn idm_step(&mut self) {
-        let idm = self.cfg.idm.clone();
+        let idm = &self.cfg.idm;
         let ocd = self.cfg.intersection.oncoming_clear_dist;
 
-        let snap: Vec<(usize, Vec2, Vec2, f32, LaneId)> = self
-            .vehicles
-            .iter()
-            .map(|v| (v.id, v.position, v.approach_dir, v.current_speed, v.lane_id))
-            .collect();
+        // Group vehicles by lane and sort them by projection along their approach direction.
+        // This transforms the car-following lookup from O(N) per vehicle to O(1) after sorting.
+        let mut lane_groups: [Vec<usize>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for (i, v) in self.vehicles.iter().enumerate() {
+            lane_groups[v.lane_id as usize].push(i);
+        }
 
-        for v in &mut self.vehicles {
-            let speed = v.current_speed;
-            let v0    = v.max_speed;
+        for group in &mut lane_groups {
+            group.sort_by(|&a, &b| {
+                let dist_a = self.vehicles[a].position.dot(self.vehicles[a].approach_dir);
+                let dist_b = self.vehicles[b].position.dot(self.vehicles[b].approach_dir);
+                dist_a.partial_cmp(&dist_b).unwrap()
+            });
+        }
 
-            // ── Bezier-turning vehicles: simplified physics ───────────────────
-            // Only free-road acceleration + oncoming yield for first half of turn.
-            if let Some(p) = v.turning_progress {
+        // Snapshot of state for consistent updates during the tick.
+        let snap = self.vehicles.clone();
+
+        for group in &lane_groups {
+            for (i, &v_idx) in group.iter().enumerate() {
+                let v = &mut self.vehicles[v_idx];
+                let speed = v.current_speed;
+                let v0 = v.max_speed;
+
+                // ── Bezier-turning vehicles: simplified physics ───────────────────
+                // Only free-road acceleration + oncoming yield for first half of turn.
+                if let Some(p) = v.turning_progress {
+                    let free_road = 1.0 - (speed / v0).powf(idm.delta);
+
+                    let (oi, ocy_id) = if p < 0.5 {
+                        let opp = oncoming_lane(v.lane_id);
+                        let closest = lane_groups[opp as usize]
+                            .iter()
+                            .map(|&idx| &snap[idx])
+                            .filter(|ov| ov.position.length() < ocd)
+                            .min_by(|a, b| a.position.length().partial_cmp(&b.position.length()).unwrap());
+
+                        if let Some(ocv) = closest {
+                            let s = v.position.length().max(f32::EPSILON);
+                            let s_star = idm.s0 + speed * idm.t_headway;
+                            ((s_star / s).powi(2), Some(ocv.id))
+                        } else {
+                            (0.0, None)
+                        }
+                    } else {
+                        (0.0, None)
+                    };
+
+                    v.oncoming_yield_id = ocy_id;
+                    v.leader_id = None;
+                    v.acceleration = (idm.a_max * (free_road - oi)).max(-idm.b_comf);
+                    v.status = VehicleStatus::Crossing;
+                    continue;
+                }
+
+                // ── Free-road term ────────────────────────────────────────────────
                 let free_road = 1.0 - (speed / v0).powf(idm.delta);
 
-                let (oi, ocy_id) = if p < 0.5 {
-                    let opp = oncoming_lane(v.lane_id);
-                    let closest = snap
-                        .iter()
-                        .filter(|(id, pos, _, _, lane)| {
-                            *id != v.id && *lane == opp && pos.length() < ocd
-                        })
-                        .min_by(|(_, a, ..), (_, b, ..)| {
-                            a.length().partial_cmp(&b.length()).unwrap()
-                        });
+                // ── Car-following: same lane only (O(1) leader lookup) ───────────
+                let leader = if i + 1 < group.len() {
+                    let l = &snap[group[i + 1]];
+                    let gap = (l.position - v.position).dot(v.approach_dir);
+                    Some((l.id, gap, l.current_speed))
+                } else {
+                    None
+                };
 
-                    if let Some((oc_id, _, ..)) = closest {
-                        let s      = v.position.length().max(f32::EPSILON);
+                v.leader_id = leader.map(|(lid, _, _)| lid);
+
+                let car_following = if let Some((_, gap, ls)) = leader {
+                    let s = (gap - idm.vehicle_length).max(f32::EPSILON);
+                    let dv = speed - ls;
+                    let s_star = idm.s0
+                        + (speed * idm.t_headway
+                            + speed * dv / (2.0 * (idm.a_max * idm.b_comf).sqrt()))
+                        .max(0.0);
+                    (s_star / s).powi(2)
+                } else {
+                    0.0
+                };
+
+                // ── Traffic-light stop-line term ──────────────────────────────────
+                let to_conflict = v.position - v.conflict_point;
+                let past_point = to_conflict.dot(v.approach_dir) > 0.0;
+                let lane_green = self.lights.is_green(v.lane_id);
+                let dist_to_stop = to_conflict.length() - idm.stop_line_offset;
+                let past_stop_line = dist_to_stop <= 0.0;
+
+                let tl_interaction = if !lane_green && !past_point && !past_stop_line {
+                    let s = dist_to_stop.max(f32::EPSILON);
+                    let s_star = idm.s0 + speed * idm.t_headway;
+                    (s_star / s).powi(2)
+                } else {
+                    0.0
+                };
+
+                // ── Left-turn oncoming yield ──────────────────────────────────────
+                let is_left = v.intent == VehicleIntent::Left;
+                let (oncoming_interaction, ocy_id) = if is_left && lane_green && !past_point {
+                    let opp = oncoming_lane(v.lane_id);
+                    let closest = lane_groups[opp as usize]
+                        .iter()
+                        .map(|&idx| &snap[idx])
+                        .filter(|ov| ov.position.length() < ocd)
+                        .min_by(|a, b| a.position.length().partial_cmp(&b.position.length()).unwrap());
+
+                    if let Some(ocv) = closest {
+                        let s = v.position.length().max(f32::EPSILON);
                         let s_star = idm.s0 + speed * idm.t_headway;
-                        ((s_star / s).powi(2), Some(*oc_id))
+                        ((s_star / s).powi(2), Some(ocv.id))
                     } else {
                         (0.0, None)
                     }
@@ -482,96 +563,24 @@ impl SimulationState {
                 };
 
                 v.oncoming_yield_id = ocy_id;
-                v.leader_id         = None;
-                v.acceleration      = (idm.a_max * (free_road - oi)).max(-idm.b_comf);
-                v.status            = VehicleStatus::Crossing;
-                continue;
-            }
 
-            // ── Free-road term ────────────────────────────────────────────────
-            let free_road = 1.0 - (speed / v0).powf(idm.delta);
+                let interaction = car_following.max(tl_interaction).max(oncoming_interaction);
+                v.acceleration = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
 
-            // ── Car-following: same lane only ─────────────────────────────────
-            let leader = snap
-                .iter()
-                .filter(|(id, _, _, _, lane)| *id != v.id && *lane == v.lane_id)
-                .filter_map(|(lid, pos, _, ls, _)| {
-                    let proj = (*pos - v.position).dot(v.approach_dir);
-                    if proj > 0.0 { Some((*lid, proj, *ls)) } else { None }
-                })
-                .min_by(|(_, a, _), (_, b, _)| a.partial_cmp(b).unwrap());
-
-            v.leader_id = leader.map(|(lid, _, _)| lid);
-
-            let car_following = if let Some((_, gap, ls)) = leader {
-                let s      = (gap - idm.vehicle_length).max(f32::EPSILON);
-                let dv     = speed - ls;
-                let s_star = idm.s0
-                    + (speed * idm.t_headway
-                        + speed * dv / (2.0 * (idm.a_max * idm.b_comf).sqrt()))
-                    .max(0.0);
-                (s_star / s).powi(2)
-            } else {
-                0.0
-            };
-
-            // ── Traffic-light stop-line term ──────────────────────────────────
-            let to_conflict    = v.position - v.conflict_point;
-            let past_point     = to_conflict.dot(v.approach_dir) > 0.0;
-            let lane_green     = self.lights.is_green(v.lane_id);
-            let dist_to_stop   = to_conflict.length() - idm.stop_line_offset;
-            let past_stop_line = dist_to_stop <= 0.0;
-
-            let tl_interaction = if !lane_green && !past_point && !past_stop_line {
-                let s      = dist_to_stop.max(f32::EPSILON);
-                let s_star = idm.s0 + speed * idm.t_headway;
-                (s_star / s).powi(2)
-            } else {
-                0.0
-            };
-
-            // ── Left-turn oncoming yield ──────────────────────────────────────
-            let is_left = v.intent == VehicleIntent::Left;
-            let (oncoming_interaction, ocy_id) = if is_left && lane_green && !past_point {
-                let opp     = oncoming_lane(v.lane_id);
-                let closest = snap
-                    .iter()
-                    .filter(|(id, pos, _, _, lane)| {
-                        *id != v.id && *lane == opp && pos.length() < ocd
-                    })
-                    .min_by(|(_, a, ..), (_, b, ..)| {
-                        a.length().partial_cmp(&b.length()).unwrap()
-                    });
-
-                if let Some((oc_id, _, ..)) = closest {
-                    let s      = v.position.length().max(f32::EPSILON);
-                    let s_star = idm.s0 + speed * idm.t_headway;
-                    ((s_star / s).powi(2), Some(*oc_id))
+                // ── Status ────────────────────────────────────────────────────────
+                let dist_to_center = v.position.length();
+                v.status = if !lane_green && !past_point && !past_stop_line {
+                    VehicleStatus::Stopped
+                } else if ocy_id.is_some() {
+                    VehicleStatus::Yielding
+                } else if (past_point || past_stop_line)
+                    && dist_to_center < self.cfg.intersection.clear_radius * 3.0
+                {
+                    VehicleStatus::Crossing
                 } else {
-                    (0.0, None)
-                }
-            } else {
-                (0.0, None)
-            };
-
-            v.oncoming_yield_id = ocy_id;
-
-            let interaction = car_following.max(tl_interaction).max(oncoming_interaction);
-            v.acceleration  = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
-
-            // ── Status ────────────────────────────────────────────────────────
-            let dist_to_center = v.position.length();
-            v.status = if !lane_green && !past_point && !past_stop_line {
-                VehicleStatus::Stopped
-            } else if ocy_id.is_some() {
-                VehicleStatus::Yielding
-            } else if (past_point || past_stop_line)
-                && dist_to_center < self.cfg.intersection.clear_radius * 3.0
-            {
-                VehicleStatus::Crossing
-            } else {
-                VehicleStatus::Cruising
-            };
+                    VehicleStatus::Cruising
+                };
+            }
         }
     }
 
