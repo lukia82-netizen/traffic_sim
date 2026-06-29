@@ -1,1 +1,7 @@
 /target
+src-tauri/target/
+node_modules/
+dist/
+*.bak
+repro_bench
+repro_bench.rs
