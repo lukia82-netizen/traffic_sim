@@ -1,0 +1,3 @@
+## 2026-02-27 - [Simulation Complexity Optimization]
+**Learning:** The traffic simulation had an $O(N^2)$ bottleneck in `idm_step` and `left_turn_step` due to redundant vehicle-to-vehicle distance checks across all vehicles. By grouping vehicles by lane and sorting them by their projection along the lane's direction, we can achieve $O(1)$ leader lookup and $O(1)$ oncoming traffic check, reducing the per-tick complexity to $O(N \log N)$ (dominated by sorting).
+**Action:** Always look for spatial or structural properties (like lanes in a traffic sim) that can be used to partition and sort data to avoid $O(N^2)$ comparisons. Pre-calculating a snapshot of the state at the start of a tick is also a good pattern for consistency and performance.
