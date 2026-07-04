@@ -1,0 +1,3 @@
+## 2025-05-14 - [O(N log N) Lane-Based Simulation]
+**Learning:** Simulation performance was bottlenecked by O(N²) interaction checks (leader lookup and oncoming yielding) in every tick. By grouping vehicles into lane-specific vectors and sorting them by travel-direction projection at the start of each tick, leader lookups become O(1) via indexing/binary search, and oncoming checks only need to iterate over relevant lane subsets.
+**Action:** Always prefer pre-sorting spatial/linear data into groups when multiple simulation steps (like IDM and yielding) need to perform proximity lookups along the same axis.

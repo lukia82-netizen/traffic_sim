@@ -12,11 +12,11 @@ use tauri::{AppHandle, Emitter};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const TARGET_FPS:     f64      = 60.0;
+const TARGET_FPS: f64 = 60.0;
 const FRAME_DURATION: Duration = Duration::from_nanos((1_000_000_000.0 / TARGET_FPS) as u64);
-const LANE_OFFSET:    f32      = 0.2;  // half-width of lane from road centre-line [world units]
-// Bezier end-point: how far past centre on the new lane the curve terminates.
-const BEZIER_EXIT_DIST: f32    = 1.5;
+const LANE_OFFSET: f32 = 0.2; // half-width of lane from road centre-line [world units]
+                              // Bezier end-point: how far past centre on the new lane the curve terminates.
+const BEZIER_EXIT_DIST: f32 = 1.5;
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
@@ -37,11 +37,12 @@ enum VehicleIntent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(usize)]
 enum LaneId {
-    North,
-    South,
-    East,
-    West,
+    North = 0,
+    South = 1,
+    East = 2,
+    West = 3,
 }
 
 /// Traffic-light phase — cycles NS-green → all-red → EW-green → all-red → …
@@ -62,8 +63,12 @@ impl LightPhase {
             LightPhase::AllRed2 => LightPhase::NSGreen,
         }
     }
-    fn ns_green(self) -> bool { matches!(self, LightPhase::NSGreen) }
-    fn ew_green(self) -> bool { matches!(self, LightPhase::EWGreen) }
+    fn ns_green(self) -> bool {
+        matches!(self, LightPhase::NSGreen)
+    }
+    fn ew_green(self) -> bool {
+        matches!(self, LightPhase::EWGreen)
+    }
 }
 
 // ─── Lane helpers ─────────────────────────────────────────────────────────────
@@ -72,19 +77,19 @@ const ALL_LANES: [LaneId; 4] = [LaneId::North, LaneId::South, LaneId::East, Lane
 
 fn lane_direction(lane: LaneId) -> Vec2 {
     match lane {
-        LaneId::North => Vec2::new( 0.0, -1.0), // southbound
-        LaneId::South => Vec2::new( 0.0,  1.0), // northbound
-        LaneId::East  => Vec2::new(-1.0,  0.0), // westbound
-        LaneId::West  => Vec2::new( 1.0,  0.0), // eastbound
+        LaneId::North => Vec2::new(0.0, -1.0), // southbound
+        LaneId::South => Vec2::new(0.0, 1.0),  // northbound
+        LaneId::East => Vec2::new(-1.0, 0.0),  // westbound
+        LaneId::West => Vec2::new(1.0, 0.0),   // eastbound
     }
 }
 
 fn lane_spawn_pos(lane: LaneId, dist: f32) -> Vec2 {
     match lane {
-        LaneId::North => Vec2::new( LANE_OFFSET,  dist),
+        LaneId::North => Vec2::new(LANE_OFFSET, dist),
         LaneId::South => Vec2::new(-LANE_OFFSET, -dist),
-        LaneId::East  => Vec2::new( dist, -LANE_OFFSET),
-        LaneId::West  => Vec2::new(-dist,  LANE_OFFSET),
+        LaneId::East => Vec2::new(dist, -LANE_OFFSET),
+        LaneId::West => Vec2::new(-dist, LANE_OFFSET),
     }
 }
 
@@ -93,17 +98,22 @@ fn oncoming_lane(lane: LaneId) -> LaneId {
     match lane {
         LaneId::North => LaneId::South,
         LaneId::South => LaneId::North,
-        LaneId::East  => LaneId::West,
-        LaneId::West  => LaneId::East,
+        LaneId::East => LaneId::West,
+        LaneId::West => LaneId::East,
     }
 }
 
 /// Map a normalised direction vector back to a LaneId.
 fn lane_for_direction(dir: Vec2) -> LaneId {
-    if      dir.x >  0.5 { LaneId::West  }
-    else if dir.x < -0.5 { LaneId::East  }
-    else if dir.y >  0.5 { LaneId::South }
-    else                 { LaneId::North }
+    if dir.x > 0.5 {
+        LaneId::West
+    } else if dir.x < -0.5 {
+        LaneId::East
+    } else if dir.y > 0.5 {
+        LaneId::South
+    } else {
+        LaneId::North
+    }
 }
 
 // ─── Quadratic Bezier helpers ─────────────────────────────────────────────────
@@ -118,7 +128,11 @@ fn bezier_pos(s: Vec2, c: Vec2, e: Vec2, t: f32) -> Vec2 {
 fn bezier_tangent(s: Vec2, c: Vec2, e: Vec2, t: f32) -> Vec2 {
     let u = 1.0 - t;
     let d = 2.0 * u * (c - s) + 2.0 * t * (e - c);
-    if d.length_squared() > 1e-12 { d.normalize() } else { (e - s).normalize() }
+    if d.length_squared() > 1e-12 {
+        d.normalize()
+    } else {
+        (e - s).normalize()
+    }
 }
 
 /// Arc length via 16-step Gaussian-style numerical integration.
@@ -127,8 +141,8 @@ fn bezier_length(s: Vec2, c: Vec2, e: Vec2) -> f32 {
     let (mut len, mut prev) = (0.0_f32, s);
     for i in 1..=N {
         let p = bezier_pos(s, c, e, i as f32 / N as f32);
-        len  += (p - prev).length();
-        prev  = p;
+        len += (p - prev).length();
+        prev = p;
     }
     len
 }
@@ -145,40 +159,53 @@ fn left_turn_ctrl(start: Vec2, end: Vec2, old_dir: Vec2) -> Vec2 {
 // ─── Simulation data ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+struct SnapVehicle {
+    id: usize,
+    pos: Vec2,
+    speed: f32,
+    proj: f32, // Position dotted with approach_dir for 1D lane sorting.
+}
+
+#[derive(Debug, Clone)]
 struct Vehicle {
-    id:                usize,
-    position:          Vec2,
-    approach_dir:      Vec2,
-    lane_id:           LaneId,
-    conflict_point:    Vec2,
-    max_speed:         f32,
-    current_speed:     f32,
-    acceleration:      f32,
-    status:            VehicleStatus,
-    intent:            VehicleIntent,
-    leader_id:         Option<usize>,
+    id: usize,
+    position: Vec2,
+    approach_dir: Vec2,
+    lane_id: LaneId,
+    conflict_point: Vec2,
+    max_speed: f32,
+    current_speed: f32,
+    acceleration: f32,
+    status: VehicleStatus,
+    intent: VehicleIntent,
+    leader_id: Option<usize>,
     oncoming_yield_id: Option<usize>,
     // ── Bezier turn state ─────────────────────────────────────────────────────
     /// Normalised curve progress [0 – 1+]; None = not currently turning.
-    turning_progress:  Option<f32>,
-    turn_start:        Vec2, // world position when the turn was triggered
-    turn_ctrl:         Vec2, // quadratic Bezier control point
-    turn_end:          Vec2, // world position at curve end (on new lane)
-    turn_curve_length: f32,  // pre-computed arc length for speed → Δp conversion
+    turning_progress: Option<f32>,
+    turn_start: Vec2,       // world position when the turn was triggered
+    turn_ctrl: Vec2,        // quadratic Bezier control point
+    turn_end: Vec2,         // world position at curve end (on new lane)
+    turn_curve_length: f32, // pre-computed arc length for speed → Δp conversion
 }
 
 // ─── Traffic Light Manager ────────────────────────────────────────────────────
 
 struct TrafficLightManager {
-    phase:           LightPhase,
-    elapsed:         f32,
-    green_duration:  f32,
+    phase: LightPhase,
+    elapsed: f32,
+    green_duration: f32,
     allred_duration: f32,
 }
 
 impl TrafficLightManager {
     fn new(green_duration: f32, allred_duration: f32) -> Self {
-        Self { phase: LightPhase::NSGreen, elapsed: 0.0, green_duration, allred_duration }
+        Self {
+            phase: LightPhase::NSGreen,
+            elapsed: 0.0,
+            green_duration,
+            allred_duration,
+        }
     }
 
     fn tick(&mut self, dt: f32) {
@@ -196,7 +223,7 @@ impl TrafficLightManager {
     fn is_green(&self, lane: LaneId) -> bool {
         match lane {
             LaneId::North | LaneId::South => self.phase.ns_green(),
-            LaneId::East  | LaneId::West  => self.phase.ew_green(),
+            LaneId::East | LaneId::West => self.phase.ew_green(),
         }
     }
 }
@@ -205,18 +232,20 @@ impl TrafficLightManager {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SimulationSection {
-    fixed_dt:   f32,
+    fixed_dt: f32,
     max_frames: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IntersectionSection {
     approach_radius: f32,
-    clear_radius:    f32,
+    clear_radius: f32,
     #[serde(default = "default_oncoming_clear_dist")]
     oncoming_clear_dist: f32,
 }
-fn default_oncoming_clear_dist() -> f32 { 3.0 }
+fn default_oncoming_clear_dist() -> f32 {
+    3.0
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TrafficLightSection {
@@ -225,27 +254,36 @@ struct TrafficLightSection {
     #[serde(default = "default_allred_duration")]
     allred_duration: f32,
 }
-fn default_green_duration()  -> f32 { 8.0 }
-fn default_allred_duration() -> f32 { 2.0 }
+fn default_green_duration() -> f32 {
+    8.0
+}
+fn default_allred_duration() -> f32 {
+    2.0
+}
 
 impl Default for TrafficLightSection {
     fn default() -> Self {
-        Self { green_duration: default_green_duration(), allred_duration: default_allred_duration() }
+        Self {
+            green_duration: default_green_duration(),
+            allred_duration: default_allred_duration(),
+        }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IdmSection {
-    a_max:            f32,
-    b_comf:           f32,
-    delta:            f32,
-    s0:               f32,
-    t_headway:        f32,
+    a_max: f32,
+    b_comf: f32,
+    delta: f32,
+    s0: f32,
+    t_headway: f32,
     stop_line_offset: f32,
     #[serde(default = "default_vehicle_length")]
     vehicle_length: f32,
 }
-fn default_vehicle_length() -> f32 { 0.2 }
+fn default_vehicle_length() -> f32 {
+    0.2
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SpawnSection {
@@ -258,10 +296,18 @@ struct SpawnSection {
     #[serde(default = "default_left_turn_probability")]
     left_turn_probability: f32,
 }
-fn default_spawn_distance()        -> f32   { 4.0 }
-fn default_offmap_distance()       -> f32   { 4.5 }
-fn default_num_vehicles()          -> usize { 4 }
-fn default_left_turn_probability() -> f32   { 0.20 }
+fn default_spawn_distance() -> f32 {
+    4.0
+}
+fn default_offmap_distance() -> f32 {
+    4.5
+}
+fn default_num_vehicles() -> usize {
+    4
+}
+fn default_left_turn_probability() -> f32 {
+    0.20
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VehicleSection {
@@ -270,33 +316,42 @@ struct VehicleSection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SimulationConfig {
-    simulation:     SimulationSection,
-    intersection:   IntersectionSection,
+    simulation: SimulationSection,
+    intersection: IntersectionSection,
     #[serde(default)]
     traffic_lights: TrafficLightSection,
-    idm:            IdmSection,
-    spawn:          SpawnSection,
-    vehicle:        VehicleSection,
+    idm: IdmSection,
+    spawn: SpawnSection,
+    vehicle: VehicleSection,
 }
 
 impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
-            simulation:   SimulationSection { fixed_dt: 0.016, max_frames: 0 },
+            simulation: SimulationSection {
+                fixed_dt: 0.016,
+                max_frames: 0,
+            },
             intersection: IntersectionSection {
-                approach_radius:     4.0,
-                clear_radius:        0.8,
+                approach_radius: 4.0,
+                clear_radius: 0.8,
                 oncoming_clear_dist: 3.0,
             },
             traffic_lights: TrafficLightSection::default(),
             idm: IdmSection {
-                a_max: 1.5, b_comf: 3.0, delta: 4.0,
-                s0: 0.6, t_headway: 0.8,
-                stop_line_offset: 1.2, vehicle_length: 0.4,
+                a_max: 1.5,
+                b_comf: 3.0,
+                delta: 4.0,
+                s0: 0.6,
+                t_headway: 0.8,
+                stop_line_offset: 1.2,
+                vehicle_length: 0.4,
             },
             spawn: SpawnSection {
-                spawn_distance: 5.0, offmap_distance: 6.0,
-                num_vehicles: 16, left_turn_probability: 0.20,
+                spawn_distance: 5.0,
+                offmap_distance: 6.0,
+                num_vehicles: 16,
+                left_turn_probability: 0.20,
             },
             vehicle: VehicleSection { max_speed: 1.0 },
         }
@@ -370,30 +425,30 @@ impl SimulationConfig {
 
 struct SimulationState {
     vehicles: Vec<Vehicle>,
-    lights:   TrafficLightManager,
-    cfg:      SimulationConfig,
+    lights: TrafficLightManager,
+    cfg: SimulationConfig,
 }
 
 impl SimulationState {
     fn new(cfg: SimulationConfig) -> Self {
         use rand::Rng;
-        let ms  = cfg.vehicle.max_speed;
-        let d   = cfg.spawn.spawn_distance;
-        let n   = cfg.spawn.num_vehicles.max(1);
+        let ms = cfg.vehicle.max_speed;
+        let d = cfg.spawn.spawn_distance;
+        let n = cfg.spawn.num_vehicles.max(1);
         let ltp = cfg.spawn.left_turn_probability;
-        let tl  = &cfg.traffic_lights;
+        let tl = &cfg.traffic_lights;
 
-        let mut rng         = rand::thread_rng();
+        let mut rng = rand::thread_rng();
         let mut lane_counts = [0usize; 4];
 
         let vehicles = (0..n)
             .map(|id| {
                 let lane_idx = rng.gen_range(0..4usize);
-                let lane     = ALL_LANES[lane_idx];
-                let rank     = lane_counts[lane_idx];
+                let lane = ALL_LANES[lane_idx];
+                let rank = lane_counts[lane_idx];
                 lane_counts[lane_idx] += 1;
-                let dir    = lane_direction(lane);
-                let pos    = lane_spawn_pos(lane, d * (rank as f32 + 1.0));
+                let dir = lane_direction(lane);
+                let pos = lane_spawn_pos(lane, d * (rank as f32 + 1.0));
                 let intent = if rng.gen::<f32>() < ltp {
                     VehicleIntent::Left
                 } else {
@@ -401,21 +456,21 @@ impl SimulationState {
                 };
                 Vehicle {
                     id,
-                    position:          pos,
-                    approach_dir:      dir,
-                    lane_id:           lane,
-                    conflict_point:    Vec2::ZERO,
-                    max_speed:         ms,
-                    current_speed:     0.0,
-                    acceleration:      0.0,
-                    status:            VehicleStatus::Cruising,
+                    position: pos,
+                    approach_dir: dir,
+                    lane_id: lane,
+                    conflict_point: Vec2::ZERO,
+                    max_speed: ms,
+                    current_speed: 0.0,
+                    acceleration: 0.0,
+                    status: VehicleStatus::Cruising,
                     intent,
-                    leader_id:         None,
+                    leader_id: None,
                     oncoming_yield_id: None,
-                    turning_progress:  None,
-                    turn_start:        Vec2::ZERO,
-                    turn_ctrl:         Vec2::ZERO,
-                    turn_end:          Vec2::ZERO,
+                    turning_progress: None,
+                    turn_start: Vec2::ZERO,
+                    turn_ctrl: Vec2::ZERO,
+                    turn_end: Vec2::ZERO,
                     turn_curve_length: 1.0,
                 }
             })
@@ -430,29 +485,40 @@ impl SimulationState {
 
     fn tick(&mut self, dt: f32) {
         self.lights.tick(dt);
-        self.idm_step();
+
+        // Snapshot and group vehicles by lane for O(N log N) simulation updates.
+        let mut groups: [Vec<SnapVehicle>; 4] = [vec![], vec![], vec![], vec![]];
+        for v in &self.vehicles {
+            groups[v.lane_id as usize].push(SnapVehicle {
+                id: v.id,
+                pos: v.position,
+                speed: v.current_speed,
+                proj: v.position.dot(lane_direction(v.lane_id)),
+            });
+        }
+        for g in &mut groups {
+            g.sort_by(|a, b| a.proj.partial_cmp(&b.proj).unwrap());
+        }
+
+        self.idm_step(&groups);
         self.movement_step(dt);
-        self.left_turn_step();
+        self.left_turn_step(&groups);
         self.remove_finished();
     }
 
-    fn is_finished(&self) -> bool { self.vehicles.is_empty() }
+    fn is_finished(&self) -> bool {
+        self.vehicles.is_empty()
+    }
 
     // ── IDM acceleration ──────────────────────────────────────────────────────
 
-    fn idm_step(&mut self) {
-        let idm = self.cfg.idm.clone();
+    fn idm_step(&mut self, groups: &[Vec<SnapVehicle>; 4]) {
+        let idm = &self.cfg.idm;
         let ocd = self.cfg.intersection.oncoming_clear_dist;
-
-        let snap: Vec<(usize, Vec2, Vec2, f32, LaneId)> = self
-            .vehicles
-            .iter()
-            .map(|v| (v.id, v.position, v.approach_dir, v.current_speed, v.lane_id))
-            .collect();
 
         for v in &mut self.vehicles {
             let speed = v.current_speed;
-            let v0    = v.max_speed;
+            let v0 = v.max_speed;
 
             // ── Bezier-turning vehicles: simplified physics ───────────────────
             // Only free-road acceleration + oncoming yield for first half of turn.
@@ -461,19 +527,15 @@ impl SimulationState {
 
                 let (oi, ocy_id) = if p < 0.5 {
                     let opp = oncoming_lane(v.lane_id);
-                    let closest = snap
+                    let closest = groups[opp as usize]
                         .iter()
-                        .filter(|(id, pos, _, _, lane)| {
-                            *id != v.id && *lane == opp && pos.length() < ocd
-                        })
-                        .min_by(|(_, a, ..), (_, b, ..)| {
-                            a.length().partial_cmp(&b.length()).unwrap()
-                        });
+                        .filter(|sv| sv.pos.length() < ocd)
+                        .min_by(|a, b| a.pos.length().partial_cmp(&b.pos.length()).unwrap());
 
-                    if let Some((oc_id, _, ..)) = closest {
-                        let s      = v.position.length().max(f32::EPSILON);
+                    if let Some(oc) = closest {
+                        let s = v.position.length().max(f32::EPSILON);
                         let s_star = idm.s0 + speed * idm.t_headway;
-                        ((s_star / s).powi(2), Some(*oc_id))
+                        ((s_star / s).powi(2), Some(oc.id))
                     } else {
                         (0.0, None)
                     }
@@ -482,9 +544,9 @@ impl SimulationState {
                 };
 
                 v.oncoming_yield_id = ocy_id;
-                v.leader_id         = None;
-                v.acceleration      = (idm.a_max * (free_road - oi)).max(-idm.b_comf);
-                v.status            = VehicleStatus::Crossing;
+                v.leader_id = None;
+                v.acceleration = (idm.a_max * (free_road - oi)).max(-idm.b_comf);
+                v.status = VehicleStatus::Crossing;
                 continue;
             }
 
@@ -492,20 +554,29 @@ impl SimulationState {
             let free_road = 1.0 - (speed / v0).powf(idm.delta);
 
             // ── Car-following: same lane only ─────────────────────────────────
-            let leader = snap
-                .iter()
-                .filter(|(id, _, _, _, lane)| *id != v.id && *lane == v.lane_id)
-                .filter_map(|(lid, pos, _, ls, _)| {
-                    let proj = (*pos - v.position).dot(v.approach_dir);
-                    if proj > 0.0 { Some((*lid, proj, *ls)) } else { None }
-                })
-                .min_by(|(_, a, _), (_, b, _)| a.partial_cmp(b).unwrap());
+            // Use O(1) leader lookup: because group is sorted by distance, the
+            // leader for vehicle at index i is the vehicle at index i+1.
+            let group = &groups[v.lane_id as usize];
+            let leader = if let Ok(idx) = group.binary_search_by(|sv| {
+                sv.proj
+                    .partial_cmp(&v.position.dot(lane_direction(v.lane_id)))
+                    .unwrap()
+            }) {
+                if idx + 1 < group.len() {
+                    Some(&group[idx + 1])
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-            v.leader_id = leader.map(|(lid, _, _)| lid);
+            v.leader_id = leader.map(|sv| sv.id);
 
-            let car_following = if let Some((_, gap, ls)) = leader {
-                let s      = (gap - idm.vehicle_length).max(f32::EPSILON);
-                let dv     = speed - ls;
+            let car_following = if let Some(sv) = leader {
+                let gap = (sv.pos - v.position).dot(lane_direction(v.lane_id));
+                let s = (gap - idm.vehicle_length).max(f32::EPSILON);
+                let dv = speed - sv.speed;
                 let s_star = idm.s0
                     + (speed * idm.t_headway
                         + speed * dv / (2.0 * (idm.a_max * idm.b_comf).sqrt()))
@@ -516,14 +587,14 @@ impl SimulationState {
             };
 
             // ── Traffic-light stop-line term ──────────────────────────────────
-            let to_conflict    = v.position - v.conflict_point;
-            let past_point     = to_conflict.dot(v.approach_dir) > 0.0;
-            let lane_green     = self.lights.is_green(v.lane_id);
-            let dist_to_stop   = to_conflict.length() - idm.stop_line_offset;
+            let to_conflict = v.position - v.conflict_point;
+            let past_point = to_conflict.dot(lane_direction(v.lane_id)) > 0.0;
+            let lane_green = self.lights.is_green(v.lane_id);
+            let dist_to_stop = to_conflict.length() - idm.stop_line_offset;
             let past_stop_line = dist_to_stop <= 0.0;
 
             let tl_interaction = if !lane_green && !past_point && !past_stop_line {
-                let s      = dist_to_stop.max(f32::EPSILON);
+                let s = dist_to_stop.max(f32::EPSILON);
                 let s_star = idm.s0 + speed * idm.t_headway;
                 (s_star / s).powi(2)
             } else {
@@ -533,20 +604,16 @@ impl SimulationState {
             // ── Left-turn oncoming yield ──────────────────────────────────────
             let is_left = v.intent == VehicleIntent::Left;
             let (oncoming_interaction, ocy_id) = if is_left && lane_green && !past_point {
-                let opp     = oncoming_lane(v.lane_id);
-                let closest = snap
+                let opp = oncoming_lane(v.lane_id);
+                let closest = groups[opp as usize]
                     .iter()
-                    .filter(|(id, pos, _, _, lane)| {
-                        *id != v.id && *lane == opp && pos.length() < ocd
-                    })
-                    .min_by(|(_, a, ..), (_, b, ..)| {
-                        a.length().partial_cmp(&b.length()).unwrap()
-                    });
+                    .filter(|sv| sv.pos.length() < ocd)
+                    .min_by(|a, b| a.pos.length().partial_cmp(&b.pos.length()).unwrap());
 
-                if let Some((oc_id, _, ..)) = closest {
-                    let s      = v.position.length().max(f32::EPSILON);
+                if let Some(oc) = closest {
+                    let s = v.position.length().max(f32::EPSILON);
                     let s_star = idm.s0 + speed * idm.t_headway;
-                    ((s_star / s).powi(2), Some(*oc_id))
+                    ((s_star / s).powi(2), Some(oc.id))
                 } else {
                     (0.0, None)
                 }
@@ -557,7 +624,7 @@ impl SimulationState {
             v.oncoming_yield_id = ocy_id;
 
             let interaction = car_following.max(tl_interaction).max(oncoming_interaction);
-            v.acceleration  = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
+            v.acceleration = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
 
             // ── Status ────────────────────────────────────────────────────────
             let dist_to_center = v.position.length();
@@ -585,9 +652,9 @@ impl SimulationState {
                 Some(p) => {
                     // Advance parameter proportional to arc-speed.
                     let new_p = p + v.current_speed * dt / v.turn_curve_length;
-                    let t     = new_p.min(1.0);
-                    v.position         = bezier_pos(v.turn_start, v.turn_ctrl, v.turn_end, t);
-                    v.approach_dir     = bezier_tangent(v.turn_start, v.turn_ctrl, v.turn_end, t);
+                    let t = new_p.min(1.0);
+                    v.position = bezier_pos(v.turn_start, v.turn_ctrl, v.turn_end, t);
+                    v.approach_dir = bezier_tangent(v.turn_start, v.turn_ctrl, v.turn_end, t);
                     v.turning_progress = Some(new_p);
                 }
                 None => {
@@ -600,64 +667,67 @@ impl SimulationState {
     // ── Bezier turn trigger + completion ──────────────────────────────────────
     // Replaces the old instant-snap left_turn_step.
 
-    fn left_turn_step(&mut self) {
+    fn left_turn_step(&mut self, groups: &[Vec<SnapVehicle>; 4]) {
         let stop_line = self.cfg.idm.stop_line_offset;
-        let ocd       = self.cfg.intersection.oncoming_clear_dist;
-
-        // Snapshot of positions + lanes for oncoming check (avoid borrow conflict).
-        let snap: Vec<(usize, Vec2, LaneId)> = self
-            .vehicles
-            .iter()
-            .map(|v| (v.id, v.position, v.lane_id))
-            .collect();
+        let ocd = self.cfg.intersection.oncoming_clear_dist;
 
         for v in &mut self.vehicles {
-            if v.intent != VehicleIntent::Left { continue; }
+            if v.intent != VehicleIntent::Left {
+                continue;
+            }
 
             // ── Complete a finished curve ─────────────────────────────────────
             match v.turning_progress {
                 Some(p) if p >= 1.0 => {
-                    v.approach_dir      = bezier_tangent(v.turn_start, v.turn_ctrl, v.turn_end, 1.0);
-                    v.position          = v.turn_end;
-                    v.lane_id           = lane_for_direction(v.approach_dir);
-                    v.intent            = VehicleIntent::Straight;
-                    v.turning_progress  = None;
-                    v.leader_id         = None;
+                    v.approach_dir = bezier_tangent(v.turn_start, v.turn_ctrl, v.turn_end, 1.0);
+                    v.position = v.turn_end;
+                    v.lane_id = lane_for_direction(v.approach_dir);
+                    v.intent = VehicleIntent::Straight;
+                    v.turning_progress = None;
+                    v.leader_id = None;
                     v.oncoming_yield_id = None;
                     continue;
                 }
                 Some(_) => continue, // mid-turn, position managed in movement_step
-                None    => {}        // fall through to trigger check
+                None => {}           // fall through to trigger check
             }
 
             // ── Trigger: at stop line, green, oncoming clear ──────────────────
             let dist_from_centre = v.position.length();
             // Accept positions that have reached or just passed the stop line.
-            if dist_from_centre > stop_line + 0.05 { continue; }
+            if dist_from_centre > stop_line + 0.05 {
+                continue;
+            }
             // Don't re-trigger once the vehicle is well past centre.
-            if v.position.dot(v.approach_dir) > 0.1 { continue; }
+            if v.position.dot(v.approach_dir) > 0.1 {
+                continue;
+            }
 
-            if !self.lights.is_green(v.lane_id) { continue; }
+            if !self.lights.is_green(v.lane_id) {
+                continue;
+            }
 
             let opp = oncoming_lane(v.lane_id);
-            let oncoming_blocks = snap.iter().any(|(id, pos, lane)| {
-                *id != v.id && *lane == opp && pos.length() < ocd
-            });
-            if oncoming_blocks { continue; }
+            let oncoming_blocks = groups[opp as usize]
+                .iter()
+                .any(|sv| sv.id != v.id && sv.pos.length() < ocd);
+            if oncoming_blocks {
+                continue;
+            }
 
             // ── Build Bezier geometry ─────────────────────────────────────────
             // CCW 90° rotation gives the exit direction for a left turn.
             let old_dir = v.approach_dir;
             let new_dir = Vec2::new(-old_dir.y, old_dir.x);
-            let end     = new_dir * BEZIER_EXIT_DIST + (-old_dir) * LANE_OFFSET;
-            let ctrl    = left_turn_ctrl(v.position, end, old_dir);
-            let clen    = bezier_length(v.position, ctrl, end).max(0.1);
+            let end = new_dir * BEZIER_EXIT_DIST + (-old_dir) * LANE_OFFSET;
+            let ctrl = left_turn_ctrl(v.position, end, old_dir);
+            let clen = bezier_length(v.position, ctrl, end).max(0.1);
 
-            v.turn_start       = v.position;
-            v.turn_ctrl        = ctrl;
-            v.turn_end         = end;
+            v.turn_start = v.position;
+            v.turn_ctrl = ctrl;
+            v.turn_end = end;
             v.turn_curve_length = clen;
-            v.turning_progress  = Some(0.0);
+            v.turning_progress = Some(0.0);
         }
     }
 
@@ -667,9 +737,11 @@ impl SimulationState {
         let offmap = self.cfg.spawn.offmap_distance;
         self.vehicles.retain(|v| {
             // Don't remove mid-turn vehicles; their lane_id hasn't switched yet.
-            if v.turning_progress.is_some() { return true; }
+            if v.turning_progress.is_some() {
+                return true;
+            }
             let to_conflict = v.position - v.conflict_point;
-            let past_point  = to_conflict.dot(v.approach_dir) > 0.0;
+            let past_point = to_conflict.dot(v.approach_dir) > 0.0;
             !(past_point && to_conflict.length() > offmap)
         });
     }
@@ -680,31 +752,31 @@ impl SimulationState {
                 .vehicles
                 .iter()
                 .map(|v| VehicleFrame {
-                    id:                v.id,
-                    x:                 v.position.x,
-                    y:                 v.position.y,
-                    dir_x:             v.approach_dir.x,
-                    dir_y:             v.approach_dir.y,
-                    status:            v.status.clone(),
-                    intent:            v.intent,
-                    speed:             v.current_speed,
-                    accel:             v.acceleration,
-                    leader_id:         v.leader_id,
+                    id: v.id,
+                    x: v.position.x,
+                    y: v.position.y,
+                    dir_x: v.approach_dir.x,
+                    dir_y: v.approach_dir.y,
+                    status: v.status.clone(),
+                    intent: v.intent,
+                    speed: v.current_speed,
+                    accel: v.acceleration,
+                    leader_id: v.leader_id,
                     oncoming_yield_id: v.oncoming_yield_id,
-                    turning_progress:  v.turning_progress,
-                    turn_start_x:      v.turn_start.x,
-                    turn_start_y:      v.turn_start.y,
-                    turn_ctrl_x:       v.turn_ctrl.x,
-                    turn_ctrl_y:       v.turn_ctrl.y,
-                    turn_end_x:        v.turn_end.x,
-                    turn_end_y:        v.turn_end.y,
+                    turning_progress: v.turning_progress,
+                    turn_start_x: v.turn_start.x,
+                    turn_start_y: v.turn_start.y,
+                    turn_ctrl_x: v.turn_ctrl.x,
+                    turn_ctrl_y: v.turn_ctrl.y,
+                    turn_end_x: v.turn_end.x,
+                    turn_end_y: v.turn_end.y,
                 })
                 .collect(),
-            approach_radius:  self.cfg.intersection.approach_radius,
-            clear_radius:     self.cfg.intersection.clear_radius,
+            approach_radius: self.cfg.intersection.approach_radius,
+            clear_radius: self.cfg.intersection.clear_radius,
             stop_line_offset: self.cfg.idm.stop_line_offset,
-            light_ns:         self.lights.phase.ns_green(),
-            light_ew:         self.lights.phase.ew_green(),
+            light_ns: self.lights.phase.ns_green(),
+            light_ew: self.lights.phase.ew_green(),
         }
     }
 }
@@ -713,35 +785,35 @@ impl SimulationState {
 
 #[derive(Serialize, Clone)]
 struct VehicleFrame {
-    id:                usize,
-    x:                 f32,
-    y:                 f32,
-    dir_x:             f32,
-    dir_y:             f32,
-    status:            VehicleStatus,
-    intent:            VehicleIntent,
-    speed:             f32,
-    accel:             f32,
-    leader_id:         Option<usize>,
+    id: usize,
+    x: f32,
+    y: f32,
+    dir_x: f32,
+    dir_y: f32,
+    status: VehicleStatus,
+    intent: VehicleIntent,
+    speed: f32,
+    accel: f32,
+    leader_id: Option<usize>,
     oncoming_yield_id: Option<usize>,
     // Bezier turn data (only meaningful when turning_progress is Some)
-    turning_progress:  Option<f32>,
-    turn_start_x:      f32,
-    turn_start_y:      f32,
-    turn_ctrl_x:       f32,
-    turn_ctrl_y:       f32,
-    turn_end_x:        f32,
-    turn_end_y:        f32,
+    turning_progress: Option<f32>,
+    turn_start_x: f32,
+    turn_start_y: f32,
+    turn_ctrl_x: f32,
+    turn_ctrl_y: f32,
+    turn_end_x: f32,
+    turn_end_y: f32,
 }
 
 #[derive(Serialize, Clone)]
 struct SimFrame {
-    vehicles:         Vec<VehicleFrame>,
-    approach_radius:  f32,
-    clear_radius:     f32,
+    vehicles: Vec<VehicleFrame>,
+    approach_radius: f32,
+    clear_radius: f32,
     stop_line_offset: f32,
-    light_ns:         bool,
-    light_ew:         bool,
+    light_ns: bool,
+    light_ew: bool,
 }
 
 // ─── Tauri commands ───────────────────────────────────────────────────────────
@@ -760,8 +832,8 @@ fn start_simulation_loop(app_handle: AppHandle, state: SharedState) {
         let mut last = Instant::now();
         loop {
             let now = Instant::now();
-            let dt  = now.duration_since(last).as_secs_f32();
-            last    = now;
+            let dt = now.duration_since(last).as_secs_f32();
+            last = now;
 
             let (frame, finished) = {
                 let mut sim = state.lock().unwrap();
