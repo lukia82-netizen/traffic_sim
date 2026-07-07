@@ -36,12 +36,13 @@ enum VehicleIntent {
     Left,
 }
 
+#[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum LaneId {
-    North,
-    South,
-    East,
-    West,
+    North = 0,
+    South = 1,
+    East = 2,
+    West = 3,
 }
 
 /// Traffic-light phase — cycles NS-green → all-red → EW-green → all-red → …
@@ -143,6 +144,15 @@ fn left_turn_ctrl(start: Vec2, end: Vec2, old_dir: Vec2) -> Vec2 {
 }
 
 // ─── Simulation data ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+struct SnapVehicle {
+    id: usize,
+    position: Vec2,
+    current_speed: f32,
+    lane_id: LaneId,
+    proj: f32,
+}
 
 #[derive(Debug, Clone)]
 struct Vehicle {
@@ -430,9 +440,26 @@ impl SimulationState {
 
     fn tick(&mut self, dt: f32) {
         self.lights.tick(dt);
-        self.idm_step();
+
+        // Create lane-grouped snapshots for O(N log N) simulation
+        let mut lanes: [Vec<SnapVehicle>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for v in &self.vehicles {
+            let l_dir = lane_direction(v.lane_id);
+            lanes[v.lane_id as usize].push(SnapVehicle {
+                id: v.id,
+                position: v.position,
+                current_speed: v.current_speed,
+                lane_id: v.lane_id,
+                proj: v.position.dot(l_dir),
+            });
+        }
+        for lane in &mut lanes {
+            lane.sort_by(|a, b| a.proj.partial_cmp(&b.proj).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        self.idm_step(&lanes);
         self.movement_step(dt);
-        self.left_turn_step();
+        self.left_turn_step(&lanes);
         self.remove_finished();
     }
 
@@ -440,15 +467,9 @@ impl SimulationState {
 
     // ── IDM acceleration ──────────────────────────────────────────────────────
 
-    fn idm_step(&mut self) {
-        let idm = self.cfg.idm.clone();
+    fn idm_step(&mut self, lanes: &[Vec<SnapVehicle>; 4]) {
+        let idm = &self.cfg.idm;
         let ocd = self.cfg.intersection.oncoming_clear_dist;
-
-        let snap: Vec<(usize, Vec2, Vec2, f32, LaneId)> = self
-            .vehicles
-            .iter()
-            .map(|v| (v.id, v.position, v.approach_dir, v.current_speed, v.lane_id))
-            .collect();
 
         for v in &mut self.vehicles {
             let speed = v.current_speed;
@@ -461,19 +482,17 @@ impl SimulationState {
 
                 let (oi, ocy_id) = if p < 0.5 {
                     let opp = oncoming_lane(v.lane_id);
-                    let closest = snap
+                    let closest = lanes[opp as usize]
                         .iter()
-                        .filter(|(id, pos, _, _, lane)| {
-                            *id != v.id && *lane == opp && pos.length() < ocd
-                        })
-                        .min_by(|(_, a, ..), (_, b, ..)| {
-                            a.length().partial_cmp(&b.length()).unwrap()
+                        .filter(|sv| sv.position.length() < ocd)
+                        .min_by(|a, b| {
+                            a.position.length().partial_cmp(&b.position.length()).unwrap()
                         });
 
-                    if let Some((oc_id, _, ..)) = closest {
+                    if let Some(oc) = closest {
                         let s      = v.position.length().max(f32::EPSILON);
                         let s_star = idm.s0 + speed * idm.t_headway;
-                        ((s_star / s).powi(2), Some(*oc_id))
+                        ((s_star / s).powi(2), Some(oc.id))
                     } else {
                         (0.0, None)
                     }
@@ -492,20 +511,20 @@ impl SimulationState {
             let free_road = 1.0 - (speed / v0).powf(idm.delta);
 
             // ── Car-following: same lane only ─────────────────────────────────
-            let leader = snap
-                .iter()
-                .filter(|(id, _, _, _, lane)| *id != v.id && *lane == v.lane_id)
-                .filter_map(|(lid, pos, _, ls, _)| {
-                    let proj = (*pos - v.position).dot(v.approach_dir);
-                    if proj > 0.0 { Some((*lid, proj, *ls)) } else { None }
-                })
-                .min_by(|(_, a, _), (_, b, _)| a.partial_cmp(b).unwrap());
+            // Efficient leader lookup using pre-sorted lane groups.
+            let lane_group = &lanes[v.lane_id as usize];
+            let v_proj = v.position.dot(v.approach_dir);
 
-            v.leader_id = leader.map(|(lid, _, _)| lid);
+            // Find the first vehicle with proj > v_proj
+            let leader_idx = lane_group.partition_point(|sv| sv.proj <= v_proj + 0.001);
+            let leader = lane_group.get(leader_idx);
 
-            let car_following = if let Some((_, gap, ls)) = leader {
+            v.leader_id = leader.map(|sv| sv.id);
+
+            let car_following = if let Some(sv) = leader {
+                let gap    = sv.proj - v_proj;
                 let s      = (gap - idm.vehicle_length).max(f32::EPSILON);
-                let dv     = speed - ls;
+                let dv     = speed - sv.current_speed;
                 let s_star = idm.s0
                     + (speed * idm.t_headway
                         + speed * dv / (2.0 * (idm.a_max * idm.b_comf).sqrt()))
@@ -534,19 +553,17 @@ impl SimulationState {
             let is_left = v.intent == VehicleIntent::Left;
             let (oncoming_interaction, ocy_id) = if is_left && lane_green && !past_point {
                 let opp     = oncoming_lane(v.lane_id);
-                let closest = snap
+                let closest = lanes[opp as usize]
                     .iter()
-                    .filter(|(id, pos, _, _, lane)| {
-                        *id != v.id && *lane == opp && pos.length() < ocd
-                    })
-                    .min_by(|(_, a, ..), (_, b, ..)| {
-                        a.length().partial_cmp(&b.length()).unwrap()
+                    .filter(|sv| sv.position.length() < ocd)
+                    .min_by(|a, b| {
+                        a.position.length().partial_cmp(&b.position.length()).unwrap()
                     });
 
-                if let Some((oc_id, _, ..)) = closest {
+                if let Some(oc) = closest {
                     let s      = v.position.length().max(f32::EPSILON);
                     let s_star = idm.s0 + speed * idm.t_headway;
-                    ((s_star / s).powi(2), Some(*oc_id))
+                    ((s_star / s).powi(2), Some(oc.id))
                 } else {
                     (0.0, None)
                 }
@@ -600,16 +617,9 @@ impl SimulationState {
     // ── Bezier turn trigger + completion ──────────────────────────────────────
     // Replaces the old instant-snap left_turn_step.
 
-    fn left_turn_step(&mut self) {
+    fn left_turn_step(&mut self, lanes: &[Vec<SnapVehicle>; 4]) {
         let stop_line = self.cfg.idm.stop_line_offset;
         let ocd       = self.cfg.intersection.oncoming_clear_dist;
-
-        // Snapshot of positions + lanes for oncoming check (avoid borrow conflict).
-        let snap: Vec<(usize, Vec2, LaneId)> = self
-            .vehicles
-            .iter()
-            .map(|v| (v.id, v.position, v.lane_id))
-            .collect();
 
         for v in &mut self.vehicles {
             if v.intent != VehicleIntent::Left { continue; }
@@ -640,9 +650,9 @@ impl SimulationState {
             if !self.lights.is_green(v.lane_id) { continue; }
 
             let opp = oncoming_lane(v.lane_id);
-            let oncoming_blocks = snap.iter().any(|(id, pos, lane)| {
-                *id != v.id && *lane == opp && pos.length() < ocd
-            });
+            let oncoming_blocks = lanes[opp as usize]
+                .iter()
+                .any(|sv| sv.position.length() < ocd);
             if oncoming_blocks { continue; }
 
             // ── Build Bezier geometry ─────────────────────────────────────────
