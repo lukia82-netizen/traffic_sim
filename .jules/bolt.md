@@ -1,0 +1,3 @@
+## 2025-05-14 - Optimized vehicle lookup from O(N^2) to O(N log N)
+**Learning:** In traffic simulations, car-following and oncoming-traffic checks are major bottlenecks when implemented with naive O(N^2) nested loops. By grouping vehicles into lanes and sorting them by position once per tick, we can use binary search for leader lookups and efficient range checks for collision avoidance.
+**Action:** Always consider spatial partitioning or pre-sorting for multi-agent systems with localized interactions. Pre-calculating projections (e.g., position dot lane direction) and using structured lane groupings significantly reduces redundant computations.
