@@ -1,5 +1,11 @@
 # Startup script for traffic_sim (Tauri 2 + Pixi.js)
 # Adds MinGW64 to PATH, prints config summary, then launches the app.
+#
+# If rustup's default host is GNU (x86_64-pc-windows-gnu), Cargo needs MinGW's
+# dlltool.exe. Prefer MSVC for this dev script so Tauri builds without MSYS binutils.
+if (-not $env:CARGO_BUILD_TARGET) {
+    $env:CARGO_BUILD_TARGET = "x86_64-pc-windows-msvc"
+}
 
 $mingwBin = "C:\msys64\mingw64\bin"
 if (-not ($env:PATH -split ";" | Where-Object { $_ -eq $mingwBin })) {

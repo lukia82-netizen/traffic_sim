@@ -2,6 +2,10 @@
   "name": "traffic-sim",
   "version": "0.1.0",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lukia82-netizen/traffic_sim.git"
+  },
   "scripts": {
     "dev": "npx tauri dev",
     "build": "npx tauri build",

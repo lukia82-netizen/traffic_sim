@@ -2,6 +2,7 @@
 name = "traffic-sim-tauri"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/lukia82-netizen/traffic_sim"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

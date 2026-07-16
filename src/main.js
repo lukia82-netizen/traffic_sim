@@ -5,6 +5,7 @@ const VEHICLE_W      = 22;   // vehicle length along heading [px]
 const VEHICLE_H      = 13;   // vehicle width across heading [px]
 const CANVAS_SIZE    = 800;
 const CENTER         = CANVAS_SIZE / 2;
+// World coords at the canvas border: ±(CANVAS_SIZE/2)/VISUAL_SCALE — keep in sync with Rust VIEWPORT_HALF_WORLD.
 
 const ROAD_HALF_PX   = 0.5 * VISUAL_SCALE;
 
@@ -30,6 +31,11 @@ const COLOR = {
   pathLane:        0xffffff,  // static dashed lane-centre guides
   pathArc:         0x44aaff,  // static left-turn arc templates
   pathArcActive:   0x88ddff,  // highlighted arc for a vehicle that is currently turning
+  intersection:  0xff33cc,  // legacy (unused); conflict debug uses conflictIdle / conflictActive
+  conflictIdle:    0x888888,
+  conflictActive:  0xff2244,
+  roadAsphalt:     0x2a2a32,
+  roadEdge:        0x4a4a58,
 };
 
 const statsEl = document.getElementById("stats");
@@ -75,12 +81,16 @@ async function main() {
 
   // ── Layer order ────────────────────────────────────────────────────────────
   const sceneLayer   = new PIXI.Graphics();
-  const pathsLayer   = new PIXI.Graphics(); // static lane guides + turn-arc templates (toggleable)
+  const roadLayer    = new PIXI.Graphics(); // thick road strips from Rust node–segment graph
+  const conflictLayer = new PIXI.Graphics(); // conflict points + active yield debug
+  const pathsLayer   = new PIXI.Graphics(); // dashed paths from sim (toggleable)
   const tlLayer      = new PIXI.Graphics(); // traffic light indicators
   const arcLayer     = new PIXI.Graphics(); // active Bezier turn-path previews
   const debugLayer   = new PIXI.Graphics(); // leader / oncoming lines
   const dynamicLayer = new PIXI.Container();
   app.stage.addChild(sceneLayer);
+  app.stage.addChild(roadLayer);
+  app.stage.addChild(conflictLayer);
   app.stage.addChild(pathsLayer);
   app.stage.addChild(tlLayer);
   app.stage.addChild(arcLayer);
@@ -92,10 +102,7 @@ async function main() {
   // ── "Show Paths" toggle button ─────────────────────────────────────────────
   const toggleBtn = document.createElement("button");
   toggleBtn.textContent = "Show Paths: OFF";
-  toggleBtn.title = "Toggle lane-centre guides and all possible left-turn arcs.\n" +
-    "Arcs follow right-hand traffic: simultaneous left-turners\n" +
-    "from opposite approaches use different intersection corners\n" +
-    "and never occupy the same space.";
+  toggleBtn.title = "Toggle dashed path geometry from the Rust sim + collision-matrix crossings.";
   Object.assign(toggleBtn.style, {
     position:   "fixed",
     top:        "10px",
@@ -160,9 +167,8 @@ async function main() {
     }
   }
 
-  // ── Path guides (drawn once, toggled by button) ───────────────────────────
+  // ── Path rendering (dashed; data from Rust `paths` + `intersections`) ───────
 
-  // Draw a dashed line between two screen points (PIXI has no native dash support).
   function drawDashedLine(g, x1, y1, x2, y2, dashLen, gapLen, style) {
     const dx  = x2 - x1, dy = y2 - y1;
     const len = Math.hypot(dx, dy);
@@ -181,80 +187,116 @@ async function main() {
     }
   }
 
-  // Draw a small arrowhead at (ex, ey) pointing in direction (dx, dy) [screen].
-  function drawArrowHead(g, ex, ey, dx, dy, size, style) {
-    const len  = Math.hypot(dx, dy);
-    if (len === 0) return;
-    const nx = dx / len, ny = dy / len;
-    const px = -ny, py = nx; // perpendicular
-    g.moveTo(ex, ey)
-     .lineTo(ex - nx * size + px * size * 0.5, ey - ny * size + py * size * 0.5)
-     .moveTo(ex, ey)
-     .lineTo(ex - nx * size - px * size * 0.5, ey - ny * size - py * size * 0.5)
-     .stroke(style);
+  function quadBezierWorld(sx, sy, cx, cy, ex, ey, t) {
+    const u = 1 - t;
+    return {
+      x: u * u * sx + 2 * u * t * cx + t * t * ex,
+      y: u * u * sy + 2 * u * t * cy + t * t * ey,
+    };
   }
 
-  // Draw all static path guides into pathsLayer (called once on first frame).
-  // All 4 turn arcs comply with right-hand traffic: simultaneous left-turners
-  // from opposite approaches occupy different intersection quadrants and their
-  // paths never intersect — vehicles pass each other "back-to-back".
-  function drawPathGuides(approachRadius, stopLineOffset) {
+  function drawDashedQuadraticWorld(g, sx, sy, cx, cy, ex, ey, dashLen, gapLen, style) {
+    const steps = 48;
+    let px = null;
+    let py = null;
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const w = quadBezierWorld(sx, sy, cx, cy, ex, ey, t);
+      const p = toScreen(w.x, w.y);
+      if (px != null) {
+        drawDashedLine(g, px, py, p.sx, p.sy, dashLen, gapLen, style);
+      }
+      px = p.sx;
+      py = p.sy;
+    }
+  }
+
+  function drawPolylineDashedWorld(g, worldPts, dashLen, gapLen, style) {
+    if (!worldPts || worldPts.length < 2) return;
+    for (let i = 0; i < worldPts.length - 1; i++) {
+      const a = toScreen(worldPts[i][0], worldPts[i][1]);
+      const b = toScreen(worldPts[i + 1][0], worldPts[i + 1][1]);
+      drawDashedLine(g, a.sx, a.sy, b.sx, b.sy, dashLen, gapLen, style);
+    }
+  }
+
+  /** Filled road cross-section from `left_edge` / `right_edge` world polylines (normals baked in Rust). */
+  function drawRoadStripPolygon(g, leftW, rightW) {
+    if (!leftW || !rightW || leftW.length < 2 || rightW.length < 2) return;
+    const p0 = toScreen(leftW[0][0], leftW[0][1]);
+    g.moveTo(p0.sx, p0.sy);
+    for (let i = 1; i < leftW.length; i++) {
+      const p = toScreen(leftW[i][0], leftW[i][1]);
+      g.lineTo(p.sx, p.sy);
+    }
+    for (let i = rightW.length - 1; i >= 0; i--) {
+      const p = toScreen(rightW[i][0], rightW[i][1]);
+      g.lineTo(p.sx, p.sy);
+    }
+    g.closePath();
+    g.fill({ color: COLOR.roadAsphalt, alpha: 0.94 });
+    g.stroke({ width: 1.2, color: COLOR.roadEdge, alpha: 0.55 });
+  }
+
+  function drawRoadVisuals(strips) {
+    roadLayer.clear();
+    if (!strips || !strips.length) return;
+    const dashLane = { width: 1.1, color: 0xffffff, alpha: 0.2 };
+    const dashDiv  = { width: 1, color: 0xdddddd, alpha: 0.32 };
+    for (const s of strips) {
+      drawRoadStripPolygon(roadLayer, s.left_edge, s.right_edge);
+      for (const line of s.lane_center_polylines || []) {
+        drawPolylineDashedWorld(roadLayer, line, 7, 6, dashLane);
+      }
+      for (const div of s.lane_dividers || []) {
+        drawPolylineDashedWorld(roadLayer, div, 6, 5, dashDiv);
+      }
+    }
+  }
+
+  /** Dashed path geometry from Rust catalogue (toggle). */
+  function drawPathsFromFrame(paths) {
     pathsLayer.clear();
-    const ar  = approachRadius * VISUAL_SCALE;
-    const slo = stopLineOffset * VISUAL_SCALE;
-    const lo  = LANE_OFFSET_W  * VISUAL_SCALE; // lane offset in px
-    const ext = BEZIER_EXIT_W  * VISUAL_SCALE; // exit distance in px
+    const dashLine = { width: 1.2, color: COLOR.pathLane, alpha: 0.4 };
+    const dashBez  = { width: 1.2, color: COLOR.pathArc, alpha: 0.5 };
+    const list = paths || [];
+    for (const p of list) {
+      if (p.kind === 0) {
+        const a = toScreen(p.x0, p.y0);
+        const b = toScreen(p.x1, p.y1);
+        drawDashedLine(pathsLayer, a.sx, a.sy, b.sx, b.sy, 8, 6, dashLine);
+      } else {
+        drawDashedQuadraticWorld(
+          pathsLayer,
+          p.x0, p.y0, p.x1, p.y1, p.x2, p.y2,
+          7, 5, dashBez,
+        );
+      }
+    }
+  }
 
-    const dashStyle = { width: 1, color: COLOR.pathLane, alpha: 0.13 };
-    const arcStyle  = { width: 1.5, color: COLOR.pathArc, alpha: 0.22 };
-    const arwStyle  = { width: 1.5, color: COLOR.pathArc, alpha: 0.35 };
-
-    // ── Straight lane centre-lines (dashed, from approach circle to stop line) ─
-    // North approach (travelling south):  x = +lo
-    drawDashedLine(pathsLayer, CENTER + lo, CENTER - ar, CENTER + lo, CENTER - slo, 7, 7, dashStyle);
-    // South approach (travelling north):  x = -lo
-    drawDashedLine(pathsLayer, CENTER - lo, CENTER + ar, CENTER - lo, CENTER + slo, 7, 7, dashStyle);
-    // East  approach (travelling west):   y = CENTER + lo  (world y = -lo)
-    drawDashedLine(pathsLayer, CENTER + ar, CENTER + lo, CENTER + slo, CENTER + lo, 7, 7, dashStyle);
-    // West  approach (travelling east):   y = CENTER - lo  (world y = +lo)
-    drawDashedLine(pathsLayer, CENTER - ar, CENTER - lo, CENTER - slo, CENTER - lo, 7, 7, dashStyle);
-
-    // ── Left-turn Bezier arc templates ────────────────────────────────────────
-    // Control points land at the four "elbow" corners (±lo, ±lo) — these are
-    // the corners of the inner lane-width square.  Each arc lives in its own
-    // quadrant, ensuring RHT back-to-back crossing for simultaneous left turns.
-    //
-    //  Arc                   start              ctrl              end              quadrant
-    //  North → traveling E   (+lo, -slo)    (+lo, -lo)       (+ext, -lo)     top-right
-    //  South → traveling W   (-lo, +slo)    (-lo, +lo)       (-ext, +lo)     bottom-left
-    //  East  → traveling S   (+slo, +lo)    (+lo, +lo)       (+lo, +ext)     bottom-right
-    //  West  → traveling N   (-slo, -lo)    (-lo, -lo)       (-lo, -ext)     top-left
-
-    const arcs = [
-      // [sx, sy,  cx, cy,  ex, ey,  exit-dx, exit-dy]  (all relative to CENTER)
-      [ lo, -slo,  lo, -lo,  ext, -lo,    1,  0 ],  // North → E (top-right quad)
-      [-lo,  slo, -lo,  lo, -ext,  lo,   -1,  0 ],  // South → W (bottom-left quad)
-      [ slo, lo,   lo,  lo,  lo,  ext,    0,  1 ],  // East  → S (bottom-right quad)
-      [-slo,-lo,  -lo, -lo, -lo, -ext,    0, -1 ],  // West  → N (top-left quad)
-    ];
-
-    for (const [sx, sy, cx, cy, ex, ey, edx, edy] of arcs) {
-      pathsLayer
-        .moveTo(CENTER + sx, CENTER + sy)
-        .quadraticCurveTo(CENTER + cx, CENTER + cy, CENTER + ex, CENTER + ey)
-        .stroke(arcStyle);
-
-      // Small arrowhead at exit point showing travel direction
-      drawArrowHead(
-        pathsLayer,
-        CENTER + ex, CENTER + ey,
-        edx, edy, 7, arwStyle,
-      );
-
-      // Small dot at arc start (on the stop line)
-      pathsLayer
-        .circle(CENTER + sx, CENTER + sy, 2.5)
-        .fill({ color: COLOR.pathArc, alpha: 0.35 });
+  /** All conflict points (grey); active TTC yield (red + lines to both vehicles). */
+  function drawConflictOverlay(conflictPoints, activeConflicts, vehicles) {
+    conflictLayer.clear();
+    const pts = conflictPoints || [];
+    for (const pt of pts) {
+      const s = toScreen(pt[0], pt[1]);
+      conflictLayer.circle(s.sx, s.sy, 3.5).fill({ color: COLOR.conflictIdle, alpha: 0.38 });
+    }
+    const byId = new Map((vehicles || []).map((v) => [v.id, v]));
+    const acts = activeConflicts || [];
+    const lineStyle = { width: 1.8, color: COLOR.conflictActive, alpha: 0.75 };
+    for (const a of acts) {
+      const s = toScreen(a.x, a.y);
+      conflictLayer.circle(s.sx, s.sy, 6).fill({ color: COLOR.conflictActive, alpha: 0.88 });
+      const yv = byId.get(a.yielder_id);
+      const ov = byId.get(a.other_id);
+      if (yv && ov) {
+        const py = toScreen(yv.x, yv.y);
+        const po = toScreen(ov.x, ov.y);
+        conflictLayer.moveTo(s.sx, s.sy).lineTo(py.sx, py.sy).stroke(lineStyle);
+        conflictLayer.moveTo(s.sx, s.sy).lineTo(po.sx, po.sy).stroke(lineStyle);
+      }
     }
   }
 
@@ -282,31 +324,28 @@ async function main() {
     tlLayer.circle(CENTER - slo, CENTER - TL_OFFSET, TL_RADIUS).stroke({ width: 1, color: 0xffffff, alpha: 0.4 });
   }
 
-  // ── Active turn-arc layer (redrawn every frame) ───────────────────────────
-  // For each vehicle currently on a Bezier turn:
-  //   1. Full arc (start → end) — highlighted path overview
-  //   2. Remaining sub-arc (current pos → end) — how far left to travel
-  //   3. Progress dot at the current position
+  // ── Active turn-arc layer (vehicle on Bezier path_id from Rust) ───────────
 
-  function drawTurnArcs(vehicles) {
+  function drawTurnArcs(vehicles, paths) {
     arcLayer.clear();
+    const byId = new Map((paths || []).map((p) => [p.id, p]));
     for (const v of vehicles) {
-      if (v.turning_progress == null) continue;
+      if (!v.on_bezier_turn) continue;
+      const def = byId.get(v.path_id);
+      if (!def || def.kind !== 1) continue;
 
-      const s   = toScreen(v.turn_start_x, v.turn_start_y);
-      const c   = toScreen(v.turn_ctrl_x,  v.turn_ctrl_y);
-      const e   = toScreen(v.turn_end_x,   v.turn_end_y);
+      const s   = toScreen(def.x0, def.y0);
+      const c   = toScreen(def.x1, def.y1);
+      const e   = toScreen(def.x2, def.y2);
       const cur = toScreen(v.x, v.y);
-      const p   = v.turning_progress;
+      const pr  = v.path_progress;
 
-      // Full path — bright highlight so it stands out from the static template
       arcLayer
         .moveTo(s.sx, s.sy)
         .quadraticCurveTo(c.sx, c.sy, e.sx, e.sy)
         .stroke({ width: 2.5, color: COLOR.pathArcActive, alpha: 0.55 });
 
-      // Remaining sub-arc (De Casteljau approximation of the [p,1] sub-curve)
-      const tR  = 1.0 - p;
+      const tR = 1.0 - Math.min(pr, 1);
       const mcx = c.sx + tR * (e.sx - c.sx);
       const mcy = c.sy + tR * (e.sy - c.sy);
       arcLayer
@@ -314,10 +353,7 @@ async function main() {
         .quadraticCurveTo(mcx, mcy, e.sx, e.sy)
         .stroke({ width: 2, color: COLOR.pathArcActive, alpha: 0.85 });
 
-      // Current-position pulse dot
       arcLayer.circle(cur.sx, cur.sy, 3.5).fill({ color: COLOR.pathArcActive, alpha: 0.9 });
-
-      // Exit point marker
       arcLayer.circle(e.sx, e.sy, 3).fill({ color: COLOR.pathArcActive, alpha: 0.45 });
     }
   }
@@ -410,7 +446,7 @@ async function main() {
     const intentTag = v.intent === "left" ? " ↰" : "";
     label.text =
       "#" + v.id + " " + v.status.toUpperCase() + intentTag + "\n" +
-      "V:" + v.speed.toFixed(2) + " A:" + v.accel.toFixed(2);
+      "V:" + v.speed.toFixed(2) + " P:" + (v.path_progress != null ? v.path_progress.toFixed(2) : "?");
     label.x = sx;
     label.y = sy - hh - 6;
   }
@@ -439,6 +475,7 @@ async function main() {
 
   statsEl.textContent = "Connecting to simulation...";
   let staticSceneDrawn = false;
+  let staticRoadDrawn  = false;
 
   try {
     const { listen } = window.__TAURI__.event;
@@ -448,12 +485,26 @@ async function main() {
 
       if (!staticSceneDrawn) {
         drawStaticScene(frame.approach_radius, frame.clear_radius, frame.stop_line_offset);
-        drawPathGuides(frame.approach_radius, frame.stop_line_offset);
         staticSceneDrawn = true;
       }
 
+      if (!staticRoadDrawn && frame.road_visuals && frame.road_visuals.length) {
+        drawRoadVisuals(frame.road_visuals);
+        staticRoadDrawn = true;
+      }
+
+      if (pathsLayer.visible) {
+        drawPathsFromFrame(frame.paths);
+      }
+
+      drawConflictOverlay(
+        frame.conflict_points || frame.intersections,
+        frame.active_conflicts,
+        frame.vehicles,
+      );
+
       drawTrafficLights(frame.light_ns, frame.light_ew, frame.stop_line_offset);
-      drawTurnArcs(frame.vehicles);
+      drawTurnArcs(frame.vehicles, frame.paths);
 
       const byId = new Map(frame.vehicles.map((v) => [v.id, v]));
 
@@ -526,6 +577,8 @@ async function main() {
 
     await listen("sim-done", () => {
       arcLayer.clear();
+      conflictLayer.clear();
+      roadLayer.clear();
       debugLayer.clear();
       tlLayer.clear();
       for (const g of vehicleGraphics.values()) dynamicLayer.removeChild(g);
