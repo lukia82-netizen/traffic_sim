@@ -135,6 +135,15 @@ fn oncoming_lane(lane: LaneId) -> LaneId {
     }
 }
 
+fn lane_idx(lane: LaneId) -> usize {
+    match lane {
+        LaneId::North => 0,
+        LaneId::South => 1,
+        LaneId::East => 2,
+        LaneId::West => 3,
+    }
+}
+
 fn lane_for_direction(dir: Vec2) -> LaneId {
     if dir.x > 0.5 {
         LaneId::West
@@ -607,7 +616,7 @@ fn evaluate_conflict_point(
     other_pid: u8,
     other_t_cp: f32,
     eff_prog: f32,
-    snap: &[ConflictSnap],
+    other_snaps: &[ConflictSnap],
     cat: &[Arc<dyn Path>],
     idm: &IdmSection,
     danger_window: f32,
@@ -633,11 +642,8 @@ fn evaluate_conflict_point(
     // Best conflicting vehicle on `other_pid`: (id, TTC to cp, scalar speed along path).
     let mut best_o: Option<(usize, f32, f32)> = None;
 
-    for (oid, _, _, o_spd, _, opid, oprog, _) in snap {
+    for (oid, _, _, o_spd, _, _, oprog, _) in other_snaps {
         if *oid == v.id {
-            continue;
-        }
-        if *opid != other_pid {
             continue;
         }
         if *oprog >= other_t_cp - 1e-4 {
@@ -704,7 +710,7 @@ fn conflict_virtual_leader_interaction(
     idm: &IdmSection,
     danger_window: f32,
     v: &Vehicle,
-    snap: &[ConflictSnap],
+    path_snaps: &[Vec<ConflictSnap>; 8],
     cat: &[Arc<dyn Path>],
     out_active: &mut Vec<ActiveConflictDto>,
 ) -> f32 {
@@ -726,7 +732,7 @@ fn conflict_virtual_leader_interaction(
             o_pid,
             o_t,
             eff,
-            snap,
+            &path_snaps[o_pid as usize],
             cat,
             idm,
             danger_window,
@@ -741,7 +747,7 @@ fn conflict_virtual_leader_interaction(
 /// conflict on the maneuver path is clearable. Already past stop or mid-curve → always true.
 fn should_enter_intersection(
     v: &Vehicle,
-    snap: &[ConflictSnap],
+    path_snaps: &[Vec<ConflictSnap>; 8],
     cat: &[Arc<dyn Path>],
     registry: &ConflictRegistry,
     idm: &IdmSection,
@@ -772,7 +778,7 @@ fn should_enter_intersection(
                 o_pid,
                 o_t,
                 eff,
-                snap,
+                &path_snaps[o_pid as usize],
                 cat,
                 idm,
                 danger_window,
@@ -879,6 +885,14 @@ impl SimulationState {
 
         let snap = snapshot_conflict(&self.vehicles);
 
+        // Group snapshots to optimize lane-based and path-based lookups from O(N^2) to O(N)
+        let mut path_snaps: [Vec<ConflictSnap>; 8] = Default::default();
+        let mut lane_snaps: [Vec<ConflictSnap>; 4] = Default::default();
+        for s in &snap {
+            path_snaps[s.5 as usize].push(*s);
+            lane_snaps[lane_idx(s.4)].push(*s);
+        }
+
         for v in &mut self.vehicles {
             let speed = v.current_speed;
             let v0 = v.max_speed;
@@ -890,10 +904,10 @@ impl SimulationState {
 
                 let (oi, ocy_id) = if p < 0.5 {
                     let opp = oncoming_lane(v.lane_id);
-                    let closest = snap
+                    let closest = lane_snaps[lane_idx(opp)]
                         .iter()
-                        .filter(|(id, pos, _, _, lane, _, _, _)| {
-                            *id != v.id && *lane == opp && pos.length() < ocd
+                        .filter(|(id, pos, _, _, _, _, _, _)| {
+                            *id != v.id && pos.length() < ocd
                         })
                         .min_by(|(_, a, ..), (_, b, ..)| {
                             a.length().partial_cmp(&b.length()).unwrap()
@@ -917,7 +931,7 @@ impl SimulationState {
                     &self.cfg.idm,
                     danger,
                     v,
-                    &snap,
+                    &path_snaps,
                     cat,
                     &mut self.active_conflicts,
                 );
@@ -936,9 +950,9 @@ impl SimulationState {
 
             let free_road = 1.0 - (speed / v0).powf(idm.delta);
 
-            let leader = snap
+            let leader = lane_snaps[lane_idx(v.lane_id)]
                 .iter()
-                .filter(|(id, _, _, _, lane, _, _, _)| *id != v.id && *lane == v.lane_id)
+                .filter(|(id, _, _, _, _, _, _, _)| *id != v.id)
                 .filter_map(|(lid, pos, _, ls, _, _, _, _)| {
                     let proj = (*pos - v.position).dot(v.approach_dir);
                     if proj > 0.0 {
@@ -970,7 +984,7 @@ impl SimulationState {
             let past_stop_line = dist_to_stop <= 0.0;
             let atomic_ok = should_enter_intersection(
                 v,
-                &snap,
+                &path_snaps,
                 cat,
                 &self.conflict_registry,
                 &self.cfg.idm,
@@ -990,10 +1004,10 @@ impl SimulationState {
             let is_left = v.intent == VehicleIntent::Left;
             let (oncoming_interaction, ocy_id) = if is_left && lane_green && !past_point {
                 let opp = oncoming_lane(v.lane_id);
-                let closest = snap
+                let closest = lane_snaps[lane_idx(opp)]
                     .iter()
-                    .filter(|(id, pos, _, _, lane, _, _, _)| {
-                        *id != v.id && *lane == opp && pos.length() < ocd
+                    .filter(|(id, pos, _, _, _, _, _, _)| {
+                        *id != v.id && pos.length() < ocd
                     })
                     .min_by(|(_, a, ..), (_, b, ..)| {
                         a.length().partial_cmp(&b.length()).unwrap()
@@ -1017,7 +1031,7 @@ impl SimulationState {
                 &self.cfg.idm,
                 danger,
                 v,
-                &snap,
+                &path_snaps,
                 cat,
                 &mut self.active_conflicts,
             );
@@ -1061,8 +1075,13 @@ impl SimulationState {
 
         let snap_lt = snapshot_conflict(&self.vehicles);
 
-        let snap: Vec<(usize, Vec2, LaneId)> =
-            self.vehicles.iter().map(|v| (v.id, v.position, v.lane_id)).collect();
+        // Group snapshots to optimize lane-based and path-based lookups from O(N^2) to O(N)
+        let mut path_snaps: [Vec<ConflictSnap>; 8] = Default::default();
+        let mut lane_snaps: [Vec<ConflictSnap>; 4] = Default::default();
+        for s in &snap_lt {
+            path_snaps[s.5 as usize].push(*s);
+            lane_snaps[lane_idx(s.4)].push(*s);
+        }
 
         for v in &mut self.vehicles {
             // ── Finish Bezier: switch to exit-lane straight ───────────────────
@@ -1101,8 +1120,8 @@ impl SimulationState {
             }
 
             let opp = oncoming_lane(v.lane_id);
-            let oncoming_blocks = snap.iter().any(|(id, pos, lane)| {
-                *id != v.id && *lane == opp && pos.length() < ocd
+            let oncoming_blocks = lane_snaps[lane_idx(opp)].iter().any(|(id, pos, _, _, _, _, _, _)| {
+                *id != v.id && pos.length() < ocd
             });
             if oncoming_blocks {
                 continue;
@@ -1110,7 +1129,7 @@ impl SimulationState {
 
             if !should_enter_intersection(
                 v,
-                &snap_lt,
+                &path_snaps,
                 cat,
                 &self.conflict_registry,
                 idm,

@@ -1,0 +1,3 @@
+## 2025-08-02 - Snapshot Grouping Optimization
+**Learning:** Nested flat-scan lookups across all vehicle snapshots scale quadratically ($O(N^2)$) and form a massive CPU bottleneck in traffic simulations with higher vehicle counts. By pre-grouping snapshots into stack-allocated arrays of vectors (`[Vec<ConflictSnap>; 4]` and `[Vec<ConflictSnap>; 8]`), we can segment queries by lane or path and reduce lookup complexity from $O(N^2)$ to $O(N)$.
+**Action:** Avoid full iterations over global state inside per-entity update functions. Group and index global state by relevant entity properties (such as lane or path) in a single $O(N)$ pass before entering loop updates.
