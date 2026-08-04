@@ -1,0 +1,3 @@
+## 2025-08-04 - Tauri Traffic Sim: Grouping and Sorting Snapshots for O(log N) Leader Lookups
+**Learning:** Grouping global vehicle snapshot arrays into lane-specific and path-specific subsets in a single O(N) pass, followed by sorting by Approach Lane Projection, completely eliminates O(N²) quadratic scaling in both leader-tracking (now O(log N) via binary search) and oncoming checks (now O(M) where M is the small count of vehicles per lane).
+**Action:** For simulations involving multi-lane traffic or road graphs, avoid flat linear scans over all vehicles. Partition elements spatially or contextually (by lane/path) and pre-calculate 1D projections to enable fast binary search querying.
