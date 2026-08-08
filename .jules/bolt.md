@@ -1,0 +1,3 @@
+## 2026-08-08 - O(N log N) Lane Grouping & Path Partitioning
+**Learning:** The core simulation logic (IDM and left turns) was bottlenecked by O(N²) flat linear scans for leader vehicles and oncoming check lookups across the entire active vehicle snapshot. By partitioning the snapshots into lane-grouped arrays sorted by their 1D position projection along the static lane direction, we can perform leader lookups using O(log M) binary search (`partition_point`). Furthermore, partitioning by path_id allows O(1) average-case conflict evaluations.
+**Action:** Always avoid O(N²) flat linear searches on generic vehicle collections. Instead, cache projection coordinates dynamically and segment them into spatial or lane-indexed arrays at the start of each tick for atomic updates.
