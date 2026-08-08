@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::sync::Arc;
 
 use crate::collision::ConflictRegistry;
-use crate::path::{BezierCurvePath, CubicBezierCurvePath, Path, left_turn_ctrl};
+use crate::path::{left_turn_ctrl, BezierCurvePath, CubicBezierCurvePath, Path};
 
 pub const P_STRAIGHT_N: u8 = 0;
 pub const P_STRAIGHT_S: u8 = 1;
@@ -162,9 +162,7 @@ fn midlines_between_polylines(polys: &[Vec<[f32; 2]>]) -> Vec<Vec<[f32; 2]>> {
         let b = &w[1];
         let n = a.len().min(b.len());
         let mid: Vec<[f32; 2]> = (0..n)
-            .map(|i| {
-                [(a[i][0] + b[i][0]) * 0.5, (a[i][1] + b[i][1]) * 0.5]
-            })
+            .map(|i| [(a[i][0] + b[i][0]) * 0.5, (a[i][1] + b[i][1]) * 0.5])
             .collect();
         out.push(mid);
     }
@@ -237,11 +235,7 @@ impl RoadGraph {
 
         let neighbor_indices: Vec<usize> = (0..base)
             .filter(|&i| {
-                self.path_junction_group
-                    .get(i)
-                    .copied()
-                    .unwrap_or(u32::MAX)
-                    == seg.junction_group
+                self.path_junction_group.get(i).copied().unwrap_or(u32::MAX) == seg.junction_group
             })
             .collect();
 
@@ -389,26 +383,10 @@ pub fn build_intersection_catalog(
     g.add_segment(seg_w, road_half);
 
     let templates: [(u8, Vec2, Vec2); 4] = [
-        (
-            P_BEZIER_N,
-            Vec2::new(0.0, -1.0),
-            Vec2::new(lo, stop),
-        ),
-        (
-            P_BEZIER_S,
-            Vec2::new(0.0, 1.0),
-            Vec2::new(-lo, -stop),
-        ),
-        (
-            P_BEZIER_E,
-            Vec2::new(-1.0, 0.0),
-            Vec2::new(stop, -lo),
-        ),
-        (
-            P_BEZIER_W,
-            Vec2::new(1.0, 0.0),
-            Vec2::new(-stop, lo),
-        ),
+        (P_BEZIER_N, Vec2::new(0.0, -1.0), Vec2::new(lo, stop)),
+        (P_BEZIER_S, Vec2::new(0.0, 1.0), Vec2::new(-lo, -stop)),
+        (P_BEZIER_E, Vec2::new(-1.0, 0.0), Vec2::new(stop, -lo)),
+        (P_BEZIER_W, Vec2::new(1.0, 0.0), Vec2::new(-stop, lo)),
     ];
 
     for (id, old_dir, start) in templates {
