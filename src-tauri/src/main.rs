@@ -872,7 +872,19 @@ impl SimulationState {
 
     fn idm_step(&mut self) {
         self.active_conflicts.clear();
-        let idm = self.cfg.idm.clone();
+        // Optimize config access by using references instead of cloning
+        let idm = &self.cfg.idm;
+        let delta_i = idm.delta as i32;
+        let delta_is_int = (idm.delta - delta_i as f32).abs() < 1e-6;
+        let free_road_calc = |speed: f32, v0: f32| -> f32 {
+            let ratio = speed / v0;
+            1.0 - if delta_is_int {
+                ratio.powi(delta_i)
+            } else {
+                ratio.powf(idm.delta)
+            }
+        };
+
         let ocd = self.cfg.intersection.oncoming_clear_dist;
         let danger = self.cfg.intersection.conflict_danger_window_s;
         let cat = &self.path_catalog;
@@ -886,7 +898,7 @@ impl SimulationState {
             // ── Bezier left-turn: free acceleration + oncoming gap first half ───
             if v.on_bezier_turn {
                 let p = v.path_progress;
-                let free_road = 1.0 - (speed / v0).powf(idm.delta);
+                let free_road = free_road_calc(speed, v0);
 
                 let (oi, ocy_id) = if p < 0.5 {
                     let opp = oncoming_lane(v.lane_id);
@@ -914,7 +926,7 @@ impl SimulationState {
 
                 let cix = conflict_virtual_leader_interaction(
                     &self.conflict_registry,
-                    &self.cfg.idm,
+                    idm,
                     danger,
                     v,
                     &snap,
@@ -934,7 +946,7 @@ impl SimulationState {
                 continue;
             }
 
-            let free_road = 1.0 - (speed / v0).powf(idm.delta);
+            let free_road = free_road_calc(speed, v0);
 
             let leader = snap
                 .iter()
@@ -973,7 +985,7 @@ impl SimulationState {
                 &snap,
                 cat,
                 &self.conflict_registry,
-                &self.cfg.idm,
+                idm,
                 danger,
             );
             let blocked_at_stop =
@@ -1014,7 +1026,7 @@ impl SimulationState {
 
             let ix_term = conflict_virtual_leader_interaction(
                 &self.conflict_registry,
-                &self.cfg.idm,
+                idm,
                 danger,
                 v,
                 &snap,
