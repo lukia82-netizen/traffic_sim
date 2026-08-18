@@ -872,7 +872,7 @@ impl SimulationState {
 
     fn idm_step(&mut self) {
         self.active_conflicts.clear();
-        let idm = self.cfg.idm.clone();
+        let idm = &self.cfg.idm;
         let ocd = self.cfg.intersection.oncoming_clear_dist;
         let danger = self.cfg.intersection.conflict_danger_window_s;
         let cat = &self.path_catalog;
@@ -1014,7 +1014,7 @@ impl SimulationState {
 
             let ix_term = conflict_virtual_leader_interaction(
                 &self.conflict_registry,
-                &self.cfg.idm,
+                idm,
                 danger,
                 v,
                 &snap,
@@ -1061,9 +1061,6 @@ impl SimulationState {
 
         let snap_lt = snapshot_conflict(&self.vehicles);
 
-        let snap: Vec<(usize, Vec2, LaneId)> =
-            self.vehicles.iter().map(|v| (v.id, v.position, v.lane_id)).collect();
-
         for v in &mut self.vehicles {
             // ── Finish Bezier: switch to exit-lane straight ───────────────────
             if v.on_bezier_turn && v.path_progress >= 1.0 {
@@ -1101,7 +1098,7 @@ impl SimulationState {
             }
 
             let opp = oncoming_lane(v.lane_id);
-            let oncoming_blocks = snap.iter().any(|(id, pos, lane)| {
+            let oncoming_blocks = snap_lt.iter().any(|(id, pos, _, _, lane, _, _, _)| {
                 *id != v.id && *lane == opp && pos.length() < ocd
             });
             if oncoming_blocks {
