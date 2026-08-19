@@ -879,6 +879,18 @@ impl SimulationState {
 
         let snap = snapshot_conflict(&self.vehicles);
 
+        // Group snapshots into pre-sorted lane-specific vectors for fast leader lookup
+        let mut lane_snaps: [Vec<ConflictSnap>; 4] = Default::default();
+        for s in &snap {
+            lane_snaps[s.4 as usize].push(*s);
+        }
+        for (i, lane_group) in lane_snaps.iter_mut().enumerate() {
+            let dir = lane_direction(ALL_LANES[i]);
+            lane_group.sort_unstable_by(|a, b| {
+                a.1.dot(dir).partial_cmp(&b.1.dot(dir)).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
         for v in &mut self.vehicles {
             let speed = v.current_speed;
             let v0 = v.max_speed;
@@ -936,18 +948,22 @@ impl SimulationState {
 
             let free_road = 1.0 - (speed / v0).powf(idm.delta);
 
-            let leader = snap
-                .iter()
-                .filter(|(id, _, _, _, lane, _, _, _)| *id != v.id && *lane == v.lane_id)
-                .filter_map(|(lid, pos, _, ls, _, _, _, _)| {
-                    let proj = (*pos - v.position).dot(v.approach_dir);
-                    if proj > 0.0 {
-                        Some((*lid, proj, *ls))
-                    } else {
-                        None
+            let lane_idx = v.lane_id as usize;
+            let v_proj = v.position.dot(lane_direction(v.lane_id));
+            let idx = lane_snaps[lane_idx].partition_point(|s| {
+                s.1.dot(lane_direction(s.4)) <= v_proj + 1e-5
+            });
+
+            let mut leader = None;
+            for s in &lane_snaps[lane_idx][idx..] {
+                if s.0 != v.id {
+                    let gap = s.1.dot(lane_direction(s.4)) - v_proj;
+                    if gap > 0.0 {
+                        leader = Some((s.0, gap, s.3));
+                        break;
                     }
-                })
-                .min_by(|(_, a, _), (_, b, _)| a.partial_cmp(&b).unwrap());
+                }
+            }
 
             v.leader_id = leader.map(|(lid, _, _)| lid);
 
