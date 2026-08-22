@@ -23,15 +23,13 @@ pub trait Path: Send + Sync {
 pub struct StraightLinePath {
     pub start: Vec2,
     pub end: Vec2,
+    length: f32,
 }
 
 impl StraightLinePath {
     pub fn new(start: Vec2, end: Vec2) -> Self {
-        Self { start, end }
-    }
-
-    fn chord_length(&self) -> f32 {
-        (self.end - self.start).length().max(1e-6)
+        let length = (end - start).length().max(1e-6);
+        Self { start, end, length }
     }
 }
 
@@ -51,11 +49,11 @@ impl Path for StraightLinePath {
     }
 
     fn path_length(&self) -> f32 {
-        self.chord_length()
+        self.length
     }
 
     fn arc_distance(&self, t0: f32, t1: f32) -> f32 {
-        (t1 - t0).abs() * self.chord_length()
+        (t1 - t0).abs() * self.length
     }
 
     fn closest_t(&self, p: Vec2) -> f32 {
@@ -68,16 +66,38 @@ impl Path for StraightLinePath {
 
 // ─── Quadratic Bezier ─────────────────────────────────────────────────────────
 
+const BEZIER_SAMPLES: usize = 64;
+
 #[derive(Debug, Clone)]
 pub struct BezierCurvePath {
     pub start: Vec2,
     pub ctrl: Vec2,
     pub end: Vec2,
+    total_length: f32,
+    cum_len: [f32; BEZIER_SAMPLES + 1],
 }
 
 impl BezierCurvePath {
     pub fn new(start: Vec2, ctrl: Vec2, end: Vec2) -> Self {
-        Self { start, ctrl, end }
+        let mut cum_len = [0.0; BEZIER_SAMPLES + 1];
+        let mut prev = start;
+        let mut total = 0.0_f32;
+        cum_len[0] = 0.0;
+        for i in 1..=BEZIER_SAMPLES {
+            let t = i as f32 / BEZIER_SAMPLES as f32;
+            let p = Self::pos(start, ctrl, end, t);
+            total += (p - prev).length();
+            cum_len[i] = total;
+            prev = p;
+        }
+        let total_length = total.max(1e-3);
+        Self {
+            start,
+            ctrl,
+            end,
+            total_length,
+            cum_len,
+        }
     }
 
     pub fn pos(s: Vec2, c: Vec2, e: Vec2, t: f32) -> Vec2 {
@@ -95,17 +115,14 @@ impl BezierCurvePath {
         }
     }
 
-    /// 10 interior samples + chord (11 segments) — per spec.
-    fn length_sampled(&self) -> f32 {
-        const N: usize = 10;
-        let (mut len, mut prev) = (0.0_f32, self.start);
-        for i in 1..=N {
-            let t = i as f32 / N as f32;
-            let p = Self::pos(self.start, self.ctrl, self.end, t);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len.max(1e-3)
+    fn arc_len_from_zero(&self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        let s = t * BEZIER_SAMPLES as f32;
+        let idx = (s as usize).min(BEZIER_SAMPLES - 1);
+        let frac = s - idx as f32;
+        let l0 = self.cum_len[idx];
+        let l1 = self.cum_len[idx + 1];
+        l0 + frac * (l1 - l0)
     }
 }
 
@@ -121,23 +138,11 @@ impl Path for BezierCurvePath {
     }
 
     fn path_length(&self) -> f32 {
-        self.length_sampled()
+        self.total_length
     }
 
     fn arc_distance(&self, t0: f32, t1: f32) -> f32 {
-        let t0 = t0.clamp(0.0, 1.0);
-        let t1 = t1.clamp(0.0, 1.0);
-        let (a, b) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
-        const N: usize = 10;
-        let mut len = 0.0_f32;
-        let mut prev = Self::pos(self.start, self.ctrl, self.end, a);
-        for i in 1..=N {
-            let u = a + (b - a) * (i as f32 / N as f32);
-            let p = Self::pos(self.start, self.ctrl, self.end, u);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len
+        (self.arc_len_from_zero(t1) - self.arc_len_from_zero(t0)).abs()
     }
 
     fn closest_t(&self, p: Vec2) -> f32 {
@@ -158,17 +163,40 @@ impl Path for BezierCurvePath {
 
 // ─── Cubic Bézier (two interior control points) ───────────────────────────────
 
+const CUBIC_SAMPLES: usize = 64;
+
 #[derive(Debug, Clone)]
 pub struct CubicBezierCurvePath {
     pub p0: Vec2,
     pub p1: Vec2,
     pub p2: Vec2,
     pub p3: Vec2,
+    total_length: f32,
+    cum_len: [f32; CUBIC_SAMPLES + 1],
 }
 
 impl CubicBezierCurvePath {
     pub fn new(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2) -> Self {
-        Self { p0, p1, p2, p3 }
+        let mut cum_len = [0.0; CUBIC_SAMPLES + 1];
+        let mut prev = p0;
+        let mut total = 0.0_f32;
+        cum_len[0] = 0.0;
+        for i in 1..=CUBIC_SAMPLES {
+            let t = i as f32 / CUBIC_SAMPLES as f32;
+            let p = Self::pos(p0, p1, p2, p3, t);
+            total += (p - prev).length();
+            cum_len[i] = total;
+            prev = p;
+        }
+        let total_length = total.max(1e-3);
+        Self {
+            p0,
+            p1,
+            p2,
+            p3,
+            total_length,
+            cum_len,
+        }
     }
 
     pub fn pos(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, t: f32) -> Vec2 {
@@ -188,16 +216,14 @@ impl CubicBezierCurvePath {
         }
     }
 
-    fn length_sampled(&self) -> f32 {
-        const N: usize = 20;
-        let (mut len, mut prev) = (0.0_f32, self.p0);
-        for i in 1..=N {
-            let t = i as f32 / N as f32;
-            let p = Self::pos(self.p0, self.p1, self.p2, self.p3, t);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len.max(1e-3)
+    fn arc_len_from_zero(&self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        let s = t * CUBIC_SAMPLES as f32;
+        let idx = (s as usize).min(CUBIC_SAMPLES - 1);
+        let frac = s - idx as f32;
+        let l0 = self.cum_len[idx];
+        let l1 = self.cum_len[idx + 1];
+        l0 + frac * (l1 - l0)
     }
 }
 
@@ -211,23 +237,11 @@ impl Path for CubicBezierCurvePath {
     }
 
     fn path_length(&self) -> f32 {
-        self.length_sampled()
+        self.total_length
     }
 
     fn arc_distance(&self, t0: f32, t1: f32) -> f32 {
-        let t0 = t0.clamp(0.0, 1.0);
-        let t1 = t1.clamp(0.0, 1.0);
-        let (a, b) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
-        const N: usize = 20;
-        let mut len = 0.0_f32;
-        let mut prev = Self::pos(self.p0, self.p1, self.p2, self.p3, a);
-        for i in 1..=N {
-            let u = a + (b - a) * (i as f32 / N as f32);
-            let p = Self::pos(self.p0, self.p1, self.p2, self.p3, u);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len
+        (self.arc_len_from_zero(t1) - self.arc_len_from_zero(t0)).abs()
     }
 
     fn closest_t(&self, p: Vec2) -> f32 {
