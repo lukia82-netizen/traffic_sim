@@ -550,7 +550,8 @@ fn effective_progress_on_path(v: &Vehicle, path_pid: u8) -> Option<f32> {
     if v.path_id == path_pid {
         return Some(v.path_progress);
     }
-    if v.intent == VehicleIntent::Left && !v.on_bezier_turn && path_pid == bezier_path_id(v.lane_id) {
+    if v.intent == VehicleIntent::Left && !v.on_bezier_turn && path_pid == bezier_path_id(v.lane_id)
+    {
         return Some(0.0);
     }
     None
@@ -569,16 +570,7 @@ fn idm_virtual_leader_term(dist: f32, speed: f32, v_lead: f32, idm: &IdmSection)
     (s_star / s).powi(2)
 }
 
-type ConflictSnap = (
-    usize,
-    Vec2,
-    Vec2,
-    f32,
-    LaneId,
-    u8,
-    f32,
-    bool,
-);
+type ConflictSnap = (usize, Vec2, Vec2, f32, LaneId, u8, f32, bool);
 
 fn snapshot_conflict(vehicles: &[Vehicle]) -> Vec<ConflictSnap> {
     vehicles
@@ -799,7 +791,8 @@ impl SimulationState {
         let ltp = cfg.spawn.left_turn_probability;
         let tl = &cfg.traffic_lights;
 
-        let (path_catalog, path_debug, conflict_registry, road_visuals) = path_catalog_with_debug(&cfg);
+        let (path_catalog, path_debug, conflict_registry, road_visuals) =
+            path_catalog_with_debug(&cfg);
 
         let mut rng = rand::thread_rng();
         let mut lane_counts = [0usize; 4];
@@ -995,9 +988,7 @@ impl SimulationState {
                     .filter(|(id, pos, _, _, lane, _, _, _)| {
                         *id != v.id && *lane == opp && pos.length() < ocd
                     })
-                    .min_by(|(_, a, ..), (_, b, ..)| {
-                        a.length().partial_cmp(&b.length()).unwrap()
-                    });
+                    .min_by(|(_, a, ..), (_, b, ..)| a.length().partial_cmp(&b.length()).unwrap());
 
                 if let Some((oc_id, _, ..)) = closest {
                     let s = v.position.length().max(f32::EPSILON);
@@ -1022,8 +1013,10 @@ impl SimulationState {
                 &mut self.active_conflicts,
             );
 
-            let interaction =
-                car_following.max(tl_interaction).max(oncoming_interaction).max(ix_term);
+            let interaction = car_following
+                .max(tl_interaction)
+                .max(oncoming_interaction)
+                .max(ix_term);
             v.acceleration = (idm.a_max * (free_road - interaction)).max(-idm.b_comf);
 
             let dist_to_center = v.position.length();
@@ -1061,8 +1054,11 @@ impl SimulationState {
 
         let snap_lt = snapshot_conflict(&self.vehicles);
 
-        let snap: Vec<(usize, Vec2, LaneId)> =
-            self.vehicles.iter().map(|v| (v.id, v.position, v.lane_id)).collect();
+        let snap: Vec<(usize, Vec2, LaneId)> = self
+            .vehicles
+            .iter()
+            .map(|v| (v.id, v.position, v.lane_id))
+            .collect();
 
         for v in &mut self.vehicles {
             // ── Finish Bezier: switch to exit-lane straight ───────────────────
@@ -1101,21 +1097,14 @@ impl SimulationState {
             }
 
             let opp = oncoming_lane(v.lane_id);
-            let oncoming_blocks = snap.iter().any(|(id, pos, lane)| {
-                *id != v.id && *lane == opp && pos.length() < ocd
-            });
+            let oncoming_blocks = snap
+                .iter()
+                .any(|(id, pos, lane)| *id != v.id && *lane == opp && pos.length() < ocd);
             if oncoming_blocks {
                 continue;
             }
 
-            if !should_enter_intersection(
-                v,
-                &snap_lt,
-                cat,
-                &self.conflict_registry,
-                idm,
-                danger,
-            ) {
+            if !should_enter_intersection(v, &snap_lt, cat, &self.conflict_registry, idm, danger) {
                 continue;
             }
 
