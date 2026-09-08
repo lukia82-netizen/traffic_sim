@@ -2,13 +2,15 @@
 
 use glam::Vec2;
 
+const BEZIER_LUT_STEPS: usize = 64;
+
 /// Normalised trajectory: `t` ∈ [0, 1] maps along the curve; speed in world units/s
 /// advances progress by `velocity * dt / path_length`.
 pub trait Path: Send + Sync {
     fn point(&self, t: f32) -> Vec2;
     /// Unit tangent (direction of increasing `t`).
     fn tangent(&self, t: f32) -> Vec2;
-    /// Total arc length (straight: chord; Bezier: 10-segment chord sum).
+    /// Total arc length (straight: chord; Bezier: precalculated cumulative lookup).
     fn path_length(&self) -> f32;
     /// Arc length from `t0` to `t1` along the curve (clamped segment).
     fn arc_distance(&self, t0: f32, t1: f32) -> f32;
@@ -73,11 +75,23 @@ pub struct BezierCurvePath {
     pub start: Vec2,
     pub ctrl: Vec2,
     pub end: Vec2,
+    /// Precalculated cumulative arc-lengths for O(1) distance lookups with linear interpolation.
+    cum_len: [f32; BEZIER_LUT_STEPS + 1],
 }
 
 impl BezierCurvePath {
     pub fn new(start: Vec2, ctrl: Vec2, end: Vec2) -> Self {
-        Self { start, ctrl, end }
+        let mut cum_len = [0.0_f32; BEZIER_LUT_STEPS + 1];
+        let mut prev = start;
+        let mut acc = 0.0_f32;
+        for i in 1..=BEZIER_LUT_STEPS {
+            let t = i as f32 / BEZIER_LUT_STEPS as f32;
+            let p = Self::pos(start, ctrl, end, t);
+            acc += (p - prev).length();
+            cum_len[i] = acc;
+            prev = p;
+        }
+        Self { start, ctrl, end, cum_len }
     }
 
     pub fn pos(s: Vec2, c: Vec2, e: Vec2, t: f32) -> Vec2 {
@@ -95,17 +109,14 @@ impl BezierCurvePath {
         }
     }
 
-    /// 10 interior samples + chord (11 segments) — per spec.
-    fn length_sampled(&self) -> f32 {
-        const N: usize = 10;
-        let (mut len, mut prev) = (0.0_f32, self.start);
-        for i in 1..=N {
-            let t = i as f32 / N as f32;
-            let p = Self::pos(self.start, self.ctrl, self.end, t);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len.max(1e-3)
+    /// O(1) cumulative arc length lookup from progress `t = 0` to `t`.
+    #[inline]
+    fn arc_len_from_zero(&self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        let idx_f = t * BEZIER_LUT_STEPS as f32;
+        let idx = (idx_f as usize).min(BEZIER_LUT_STEPS - 1);
+        let frac = idx_f - idx as f32;
+        self.cum_len[idx] + frac * (self.cum_len[idx + 1] - self.cum_len[idx])
     }
 }
 
@@ -120,24 +131,14 @@ impl Path for BezierCurvePath {
         Self::tan(self.start, self.ctrl, self.end, t)
     }
 
+    #[inline]
     fn path_length(&self) -> f32 {
-        self.length_sampled()
+        self.cum_len[BEZIER_LUT_STEPS].max(1e-3)
     }
 
+    #[inline]
     fn arc_distance(&self, t0: f32, t1: f32) -> f32 {
-        let t0 = t0.clamp(0.0, 1.0);
-        let t1 = t1.clamp(0.0, 1.0);
-        let (a, b) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
-        const N: usize = 10;
-        let mut len = 0.0_f32;
-        let mut prev = Self::pos(self.start, self.ctrl, self.end, a);
-        for i in 1..=N {
-            let u = a + (b - a) * (i as f32 / N as f32);
-            let p = Self::pos(self.start, self.ctrl, self.end, u);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len
+        (self.arc_len_from_zero(t1) - self.arc_len_from_zero(t0)).abs()
     }
 
     fn closest_t(&self, p: Vec2) -> f32 {
@@ -164,11 +165,23 @@ pub struct CubicBezierCurvePath {
     pub p1: Vec2,
     pub p2: Vec2,
     pub p3: Vec2,
+    /// Precalculated cumulative arc-lengths for O(1) distance lookups with linear interpolation.
+    cum_len: [f32; BEZIER_LUT_STEPS + 1],
 }
 
 impl CubicBezierCurvePath {
     pub fn new(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2) -> Self {
-        Self { p0, p1, p2, p3 }
+        let mut cum_len = [0.0_f32; BEZIER_LUT_STEPS + 1];
+        let mut prev = p0;
+        let mut acc = 0.0_f32;
+        for i in 1..=BEZIER_LUT_STEPS {
+            let t = i as f32 / BEZIER_LUT_STEPS as f32;
+            let p = Self::pos(p0, p1, p2, p3, t);
+            acc += (p - prev).length();
+            cum_len[i] = acc;
+            prev = p;
+        }
+        Self { p0, p1, p2, p3, cum_len }
     }
 
     pub fn pos(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, t: f32) -> Vec2 {
@@ -188,16 +201,14 @@ impl CubicBezierCurvePath {
         }
     }
 
-    fn length_sampled(&self) -> f32 {
-        const N: usize = 20;
-        let (mut len, mut prev) = (0.0_f32, self.p0);
-        for i in 1..=N {
-            let t = i as f32 / N as f32;
-            let p = Self::pos(self.p0, self.p1, self.p2, self.p3, t);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len.max(1e-3)
+    /// O(1) cumulative arc length lookup from progress `t = 0` to `t`.
+    #[inline]
+    fn arc_len_from_zero(&self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        let idx_f = t * BEZIER_LUT_STEPS as f32;
+        let idx = (idx_f as usize).min(BEZIER_LUT_STEPS - 1);
+        let frac = idx_f - idx as f32;
+        self.cum_len[idx] + frac * (self.cum_len[idx + 1] - self.cum_len[idx])
     }
 }
 
@@ -210,24 +221,14 @@ impl Path for CubicBezierCurvePath {
         Self::tan(self.p0, self.p1, self.p2, self.p3, t)
     }
 
+    #[inline]
     fn path_length(&self) -> f32 {
-        self.length_sampled()
+        self.cum_len[BEZIER_LUT_STEPS].max(1e-3)
     }
 
+    #[inline]
     fn arc_distance(&self, t0: f32, t1: f32) -> f32 {
-        let t0 = t0.clamp(0.0, 1.0);
-        let t1 = t1.clamp(0.0, 1.0);
-        let (a, b) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
-        const N: usize = 20;
-        let mut len = 0.0_f32;
-        let mut prev = Self::pos(self.p0, self.p1, self.p2, self.p3, a);
-        for i in 1..=N {
-            let u = a + (b - a) * (i as f32 / N as f32);
-            let p = Self::pos(self.p0, self.p1, self.p2, self.p3, u);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len
+        (self.arc_len_from_zero(t1) - self.arc_len_from_zero(t0)).abs()
     }
 
     fn closest_t(&self, p: Vec2) -> f32 {
