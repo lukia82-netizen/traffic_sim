@@ -1,0 +1,3 @@
+## 2025-05-18 - Grouping Vehicle Snapshots into Lane and Path Lookup Arrays
+**Learning:** In multi-vehicle simulation loops (`idm_step` and `left_turn_step`), repeatedly scanning the full vehicle slice `N` times for oncoming, leader, and conflict checks creates O(N²) quadratic scaling. Pre-grouping snapshots into stack-allocated fixed-size lane (`[Vec<T>; 4]`) and path (`[Vec<T>; 8]`) lookup arrays in a single O(N) pass reduces filtering overheads significantly without introducing heap allocation churn per vehicle iteration.
+**Action:** Always group simulation entities by spatial bounds or discrete categorizations (lanes/paths) at the start of tick steps when pairwise interaction checks occur.
