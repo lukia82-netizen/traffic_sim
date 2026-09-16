@@ -872,7 +872,8 @@ impl SimulationState {
 
     fn idm_step(&mut self) {
         self.active_conflicts.clear();
-        let idm = self.cfg.idm.clone();
+        // Borrow IDM config instead of cloning each frame to save memory allocations
+        let idm = &self.cfg.idm;
         let ocd = self.cfg.intersection.oncoming_clear_dist;
         let danger = self.cfg.intersection.conflict_danger_window_s;
         let cat = &self.path_catalog;
@@ -1059,10 +1060,8 @@ impl SimulationState {
         let danger = self.cfg.intersection.conflict_danger_window_s;
         let idm = &self.cfg.idm;
 
+        // Reuse ConflictSnap snapshot vector to eliminate redundant per-frame allocation
         let snap_lt = snapshot_conflict(&self.vehicles);
-
-        let snap: Vec<(usize, Vec2, LaneId)> =
-            self.vehicles.iter().map(|v| (v.id, v.position, v.lane_id)).collect();
 
         for v in &mut self.vehicles {
             // ── Finish Bezier: switch to exit-lane straight ───────────────────
@@ -1101,7 +1100,7 @@ impl SimulationState {
             }
 
             let opp = oncoming_lane(v.lane_id);
-            let oncoming_blocks = snap.iter().any(|(id, pos, lane)| {
+            let oncoming_blocks = snap_lt.iter().any(|(id, pos, _, _, lane, _, _, _)| {
                 *id != v.id && *lane == opp && pos.length() < ocd
             });
             if oncoming_blocks {
