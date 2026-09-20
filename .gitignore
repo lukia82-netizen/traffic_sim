@@ -1,1 +1,4 @@
 /target
+/C:*
+C:\*
+C:\cargo-target
