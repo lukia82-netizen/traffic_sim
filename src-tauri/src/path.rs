@@ -8,7 +8,7 @@ pub trait Path: Send + Sync {
     fn point(&self, t: f32) -> Vec2;
     /// Unit tangent (direction of increasing `t`).
     fn tangent(&self, t: f32) -> Vec2;
-    /// Total arc length (straight: chord; Bezier: 10-segment chord sum).
+    /// Total arc length.
     fn path_length(&self) -> f32;
     /// Arc length from `t0` to `t1` along the curve (clamped segment).
     fn arc_distance(&self, t0: f32, t1: f32) -> f32;
@@ -66,6 +66,19 @@ impl Path for StraightLinePath {
     }
 }
 
+// ─── Cumulative lookup helper ──────────────────────────────────────────────────
+
+const CUM_SAMPLES: usize = 64;
+
+/// Returns cumulative distance from t=0 to progress `t` using O(1) table lookup with linear interpolation.
+fn cum_dist_at(t: f32, table: &[f32; CUM_SAMPLES + 1]) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    let s = t * (CUM_SAMPLES as f32);
+    let idx = (s as usize).min(CUM_SAMPLES - 1);
+    let frac = s - (idx as f32);
+    table[idx] + frac * (table[idx + 1] - table[idx])
+}
+
 // ─── Quadratic Bezier ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -73,11 +86,24 @@ pub struct BezierCurvePath {
     pub start: Vec2,
     pub ctrl: Vec2,
     pub end: Vec2,
+    /// Precalculated cumulative arc lengths at t = i / CUM_SAMPLES for O(1) distance lookups.
+    cum_len: [f32; CUM_SAMPLES + 1],
 }
 
 impl BezierCurvePath {
     pub fn new(start: Vec2, ctrl: Vec2, end: Vec2) -> Self {
-        Self { start, ctrl, end }
+        let mut cum_len = [0.0_f32; CUM_SAMPLES + 1];
+        let mut prev = start;
+        for i in 1..=CUM_SAMPLES {
+            let t = i as f32 / CUM_SAMPLES as f32;
+            let p = Self::pos(start, ctrl, end, t);
+            cum_len[i] = cum_len[i - 1] + (p - prev).length();
+            prev = p;
+        }
+        if cum_len[CUM_SAMPLES] < 1e-3 {
+            cum_len[CUM_SAMPLES] = 1e-3;
+        }
+        Self { start, ctrl, end, cum_len }
     }
 
     pub fn pos(s: Vec2, c: Vec2, e: Vec2, t: f32) -> Vec2 {
@@ -94,19 +120,6 @@ impl BezierCurvePath {
             (e - s).normalize()
         }
     }
-
-    /// 10 interior samples + chord (11 segments) — per spec.
-    fn length_sampled(&self) -> f32 {
-        const N: usize = 10;
-        let (mut len, mut prev) = (0.0_f32, self.start);
-        for i in 1..=N {
-            let t = i as f32 / N as f32;
-            let p = Self::pos(self.start, self.ctrl, self.end, t);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len.max(1e-3)
-    }
 }
 
 impl Path for BezierCurvePath {
@@ -121,30 +134,18 @@ impl Path for BezierCurvePath {
     }
 
     fn path_length(&self) -> f32 {
-        self.length_sampled()
+        self.cum_len[CUM_SAMPLES]
     }
 
     fn arc_distance(&self, t0: f32, t1: f32) -> f32 {
-        let t0 = t0.clamp(0.0, 1.0);
-        let t1 = t1.clamp(0.0, 1.0);
-        let (a, b) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
-        const N: usize = 10;
-        let mut len = 0.0_f32;
-        let mut prev = Self::pos(self.start, self.ctrl, self.end, a);
-        for i in 1..=N {
-            let u = a + (b - a) * (i as f32 / N as f32);
-            let p = Self::pos(self.start, self.ctrl, self.end, u);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len
+        (cum_dist_at(t1, &self.cum_len) - cum_dist_at(t0, &self.cum_len)).abs()
     }
 
     fn closest_t(&self, p: Vec2) -> f32 {
         let mut best_t = 0.0_f32;
         let mut best_d = f32::MAX;
-        for i in 0..=64 {
-            let t = i as f32 / 64.0;
+        for i in 0..=CUM_SAMPLES {
+            let t = i as f32 / CUM_SAMPLES as f32;
             let q = self.point(t);
             let d = q.distance_squared(p);
             if d < best_d {
@@ -164,11 +165,24 @@ pub struct CubicBezierCurvePath {
     pub p1: Vec2,
     pub p2: Vec2,
     pub p3: Vec2,
+    /// Precalculated cumulative arc lengths at t = i / CUM_SAMPLES for O(1) distance lookups.
+    cum_len: [f32; CUM_SAMPLES + 1],
 }
 
 impl CubicBezierCurvePath {
     pub fn new(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2) -> Self {
-        Self { p0, p1, p2, p3 }
+        let mut cum_len = [0.0_f32; CUM_SAMPLES + 1];
+        let mut prev = p0;
+        for i in 1..=CUM_SAMPLES {
+            let t = i as f32 / CUM_SAMPLES as f32;
+            let p = Self::pos(p0, p1, p2, p3, t);
+            cum_len[i] = cum_len[i - 1] + (p - prev).length();
+            prev = p;
+        }
+        if cum_len[CUM_SAMPLES] < 1e-3 {
+            cum_len[CUM_SAMPLES] = 1e-3;
+        }
+        Self { p0, p1, p2, p3, cum_len }
     }
 
     pub fn pos(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, t: f32) -> Vec2 {
@@ -187,18 +201,6 @@ impl CubicBezierCurvePath {
             (p3 - p0).normalize()
         }
     }
-
-    fn length_sampled(&self) -> f32 {
-        const N: usize = 20;
-        let (mut len, mut prev) = (0.0_f32, self.p0);
-        for i in 1..=N {
-            let t = i as f32 / N as f32;
-            let p = Self::pos(self.p0, self.p1, self.p2, self.p3, t);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len.max(1e-3)
-    }
 }
 
 impl Path for CubicBezierCurvePath {
@@ -211,30 +213,18 @@ impl Path for CubicBezierCurvePath {
     }
 
     fn path_length(&self) -> f32 {
-        self.length_sampled()
+        self.cum_len[CUM_SAMPLES]
     }
 
     fn arc_distance(&self, t0: f32, t1: f32) -> f32 {
-        let t0 = t0.clamp(0.0, 1.0);
-        let t1 = t1.clamp(0.0, 1.0);
-        let (a, b) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
-        const N: usize = 20;
-        let mut len = 0.0_f32;
-        let mut prev = Self::pos(self.p0, self.p1, self.p2, self.p3, a);
-        for i in 1..=N {
-            let u = a + (b - a) * (i as f32 / N as f32);
-            let p = Self::pos(self.p0, self.p1, self.p2, self.p3, u);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len
+        (cum_dist_at(t1, &self.cum_len) - cum_dist_at(t0, &self.cum_len)).abs()
     }
 
     fn closest_t(&self, p: Vec2) -> f32 {
         let mut best_t = 0.0_f32;
         let mut best_d = f32::MAX;
-        for i in 0..=64 {
-            let t = i as f32 / 64.0;
+        for i in 0..=CUM_SAMPLES {
+            let t = i as f32 / CUM_SAMPLES as f32;
             let q = self.point(t);
             let d = q.distance_squared(p);
             if d < best_d {
@@ -250,4 +240,39 @@ impl Path for CubicBezierCurvePath {
 pub fn left_turn_ctrl(start: Vec2, end: Vec2, old_dir: Vec2) -> Vec2 {
     let c1 = (end - start).dot(old_dir);
     start + c1 * old_dir
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bezier_arc_distance() {
+        let path = BezierCurvePath::new(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(5.0, 10.0),
+            Vec2::new(10.0, 0.0),
+        );
+        let total_len = path.path_length();
+        assert!(total_len > 10.0);
+        let dist_full = path.arc_distance(0.0, 1.0);
+        assert!((total_len - dist_full).abs() < 1e-4);
+
+        let half_dist = path.arc_distance(0.0, 0.5);
+        assert!((half_dist - total_len / 2.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn test_cubic_bezier_arc_distance() {
+        let path = CubicBezierCurvePath::new(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(3.0, 6.0),
+            Vec2::new(7.0, 6.0),
+            Vec2::new(10.0, 0.0),
+        );
+        let total_len = path.path_length();
+        assert!(total_len > 10.0);
+        let dist_full = path.arc_distance(0.0, 1.0);
+        assert!((total_len - dist_full).abs() < 1e-4);
+    }
 }
