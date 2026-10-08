@@ -535,14 +535,15 @@ fn conflict_params_on_path(cp: &ConflictPoint, path_pid: u8) -> Option<(f32, u8,
 }
 
 /// Paths that must be conflict-free for atomic entry (straight + future Bezier for left intent).
-fn maneuver_path_ids(v: &Vehicle) -> Vec<u8> {
+/// Returns stack-allocated array and count to avoid heap allocation in simulation loop.
+#[inline]
+fn maneuver_path_ids(v: &Vehicle) -> ([u8; 2], usize) {
     if v.on_bezier_turn {
-        return vec![v.path_id];
-    }
-    if v.intent == VehicleIntent::Left {
-        vec![straight_path_id(v.lane_id), bezier_path_id(v.lane_id)]
+        ([v.path_id, 0], 1)
+    } else if v.intent == VehicleIntent::Left {
+        ([straight_path_id(v.lane_id), bezier_path_id(v.lane_id)], 2)
     } else {
-        vec![v.path_id]
+        ([v.path_id, 0], 1)
     }
 }
 
@@ -756,7 +757,8 @@ fn should_enter_intersection(
         return true;
     }
 
-    for path_pid in maneuver_path_ids(v) {
+    let (pids, pcount) = maneuver_path_ids(v);
+    for &path_pid in &pids[..pcount] {
         let Some(eff) = effective_progress_on_path(v, path_pid) else {
             continue;
         };
@@ -872,7 +874,7 @@ impl SimulationState {
 
     fn idm_step(&mut self) {
         self.active_conflicts.clear();
-        let idm = self.cfg.idm.clone();
+        let idm = &self.cfg.idm;
         let ocd = self.cfg.intersection.oncoming_clear_dist;
         let danger = self.cfg.intersection.conflict_danger_window_s;
         let cat = &self.path_catalog;
@@ -1061,9 +1063,6 @@ impl SimulationState {
 
         let snap_lt = snapshot_conflict(&self.vehicles);
 
-        let snap: Vec<(usize, Vec2, LaneId)> =
-            self.vehicles.iter().map(|v| (v.id, v.position, v.lane_id)).collect();
-
         for v in &mut self.vehicles {
             // ── Finish Bezier: switch to exit-lane straight ───────────────────
             if v.on_bezier_turn && v.path_progress >= 1.0 {
@@ -1101,7 +1100,7 @@ impl SimulationState {
             }
 
             let opp = oncoming_lane(v.lane_id);
-            let oncoming_blocks = snap.iter().any(|(id, pos, lane)| {
+            let oncoming_blocks = snap_lt.iter().any(|(id, pos, _, _, lane, ..)| {
                 *id != v.id && *lane == opp && pos.length() < ocd
             });
             if oncoming_blocks {
