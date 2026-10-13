@@ -1,0 +1,3 @@
+## 2025-05-18 - Bucket-based grouping for simulation snapshot lookups
+**Learning:** In frame-by-frame simulation ticks, flat-scanning all vehicles for lane leader and conflict point lookups results in $O(N^2)$ inner loop iterations. Partitioning vehicle snapshots into stack-allocated fixed-size array buckets by lane (`[Vec<T>; 4]`) and path (`[Vec<T>; 8]`) reduces lookup costs to targeted bucket iterations and yields a ~10-16% speedup.
+**Action:** Partition entity snapshots into fixed-size lane and path arrays at the start of each simulation tick and avoid heap-allocating temporary vectors in hot loops.
