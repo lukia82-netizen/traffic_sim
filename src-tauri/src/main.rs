@@ -535,14 +535,13 @@ fn conflict_params_on_path(cp: &ConflictPoint, path_pid: u8) -> Option<(f32, u8,
 }
 
 /// Paths that must be conflict-free for atomic entry (straight + future Bezier for left intent).
-fn maneuver_path_ids(v: &Vehicle) -> Vec<u8> {
+fn maneuver_path_ids(v: &Vehicle) -> ([u8; 2], usize) {
     if v.on_bezier_turn {
-        return vec![v.path_id];
-    }
-    if v.intent == VehicleIntent::Left {
-        vec![straight_path_id(v.lane_id), bezier_path_id(v.lane_id)]
+        ([v.path_id, 0], 1)
+    } else if v.intent == VehicleIntent::Left {
+        ([straight_path_id(v.lane_id), bezier_path_id(v.lane_id)], 2)
     } else {
-        vec![v.path_id]
+        ([v.path_id, 0], 1)
     }
 }
 
@@ -756,7 +755,8 @@ fn should_enter_intersection(
         return true;
     }
 
-    for path_pid in maneuver_path_ids(v) {
+    let (m_paths, m_count) = maneuver_path_ids(v);
+    for &path_pid in &m_paths[..m_count] {
         let Some(eff) = effective_progress_on_path(v, path_pid) else {
             continue;
         };
