@@ -185,12 +185,12 @@ fn wire_bezier(id: u8, b: &BezierCurvePath) -> PathDebugWire {
     PathDebugWire {
         id,
         kind: 1,
-        x0: b.start.x,
-        y0: b.start.y,
-        x1: b.ctrl.x,
-        y1: b.ctrl.y,
-        x2: b.end.x,
-        y2: b.end.y,
+        x0: b.start().x,
+        y0: b.start().y,
+        x1: b.ctrl().x,
+        y1: b.ctrl().y,
+        x2: b.end().x,
+        y2: b.end().y,
     }
 }
 
