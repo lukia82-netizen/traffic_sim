@@ -138,7 +138,7 @@ pub struct BuiltRoad {
 }
 
 fn lateral_normal(c: &CubicBezierCurvePath, t: f32) -> Vec2 {
-    let tg = CubicBezierCurvePath::tan(c.p0, c.p1, c.p2, c.p3, t);
+    let tg = CubicBezierCurvePath::tan(c.p0(), c.p1(), c.p2(), c.p3(), t);
     let n = Vec2::new(-tg.y, tg.x);
     if n.length_squared() > 1e-12 {
         n.normalize()
@@ -185,12 +185,12 @@ fn wire_bezier(id: u8, b: &BezierCurvePath) -> PathDebugWire {
     PathDebugWire {
         id,
         kind: 1,
-        x0: b.start.x,
-        y0: b.start.y,
-        x1: b.ctrl.x,
-        y1: b.ctrl.y,
-        x2: b.end.x,
-        y2: b.end.y,
+        x0: b.start().x,
+        y0: b.start().y,
+        x1: b.ctrl().x,
+        y1: b.ctrl().y,
+        x2: b.end().x,
+        y2: b.end().y,
     }
 }
 
