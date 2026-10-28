@@ -872,7 +872,8 @@ impl SimulationState {
 
     fn idm_step(&mut self) {
         self.active_conflicts.clear();
-        let idm = self.cfg.idm.clone();
+        // Borrow IDM config section instead of cloning per tick
+        let idm = &self.cfg.idm;
         let ocd = self.cfg.intersection.oncoming_clear_dist;
         let danger = self.cfg.intersection.conflict_danger_window_s;
         let cat = &self.path_catalog;
