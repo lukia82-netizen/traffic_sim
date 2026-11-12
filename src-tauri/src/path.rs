@@ -68,16 +68,35 @@ impl Path for StraightLinePath {
 
 // ─── Quadratic Bezier ─────────────────────────────────────────────────────────
 
+const BEZIER_LUT_STEPS: usize = 64;
+
 #[derive(Debug, Clone)]
 pub struct BezierCurvePath {
     pub start: Vec2,
     pub ctrl: Vec2,
     pub end: Vec2,
+    /// Precomputed cumulative arc-length lookup table for O(1) distance queries.
+    cum_len: [f32; BEZIER_LUT_STEPS + 1],
 }
 
 impl BezierCurvePath {
     pub fn new(start: Vec2, ctrl: Vec2, end: Vec2) -> Self {
-        Self { start, ctrl, end }
+        let mut cum_len = [0.0_f32; BEZIER_LUT_STEPS + 1];
+        let mut prev = start;
+        let mut acc = 0.0_f32;
+        for i in 1..=BEZIER_LUT_STEPS {
+            let t = i as f32 / BEZIER_LUT_STEPS as f32;
+            let p = Self::pos(start, ctrl, end, t);
+            acc += (p - prev).length();
+            cum_len[i] = acc;
+            prev = p;
+        }
+        Self {
+            start,
+            ctrl,
+            end,
+            cum_len,
+        }
     }
 
     pub fn pos(s: Vec2, c: Vec2, e: Vec2, t: f32) -> Vec2 {
@@ -95,17 +114,13 @@ impl BezierCurvePath {
         }
     }
 
-    /// 10 interior samples + chord (11 segments) — per spec.
-    fn length_sampled(&self) -> f32 {
-        const N: usize = 10;
-        let (mut len, mut prev) = (0.0_f32, self.start);
-        for i in 1..=N {
-            let t = i as f32 / N as f32;
-            let p = Self::pos(self.start, self.ctrl, self.end, t);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len.max(1e-3)
+    /// Evaluates cumulative arc length from t = 0 to t via linear interpolation on the LUT.
+    fn arc_len_to(&self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        let s = t * BEZIER_LUT_STEPS as f32;
+        let idx = (s.floor() as usize).min(BEZIER_LUT_STEPS - 1);
+        let frac = s - idx as f32;
+        self.cum_len[idx] + frac * (self.cum_len[idx + 1] - self.cum_len[idx])
     }
 }
 
@@ -121,23 +136,11 @@ impl Path for BezierCurvePath {
     }
 
     fn path_length(&self) -> f32 {
-        self.length_sampled()
+        self.cum_len[BEZIER_LUT_STEPS].max(1e-3)
     }
 
     fn arc_distance(&self, t0: f32, t1: f32) -> f32 {
-        let t0 = t0.clamp(0.0, 1.0);
-        let t1 = t1.clamp(0.0, 1.0);
-        let (a, b) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
-        const N: usize = 10;
-        let mut len = 0.0_f32;
-        let mut prev = Self::pos(self.start, self.ctrl, self.end, a);
-        for i in 1..=N {
-            let u = a + (b - a) * (i as f32 / N as f32);
-            let p = Self::pos(self.start, self.ctrl, self.end, u);
-            len += (p - prev).length();
-            prev = p;
-        }
-        len
+        (self.arc_len_to(t1) - self.arc_len_to(t0)).abs()
     }
 
     fn closest_t(&self, p: Vec2) -> f32 {
